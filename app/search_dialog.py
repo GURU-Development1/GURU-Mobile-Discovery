@@ -19,10 +19,14 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QMessageBox,
     QDateEdit,
+    QCalendarWidget,
+    QAbstractSpinBox,
+    QWidget,
 )
-from PyQt6.QtCore import QDate, pyqtSignal
+from PyQt6.QtCore import QDate, Qt, QSize, pyqtSignal
 
 from app.saved_searches import add_saved_search
+from app.style import icon as load_icon
 
 
 def _criteria_from_form(
@@ -55,6 +59,7 @@ class SearchDialog(QDialog):
         self._app_data_root = Path(app_data_root)
         self.setWindowTitle("Search messages")
         self.setMinimumWidth(480)
+        self.setWindowFlag(Qt.WindowType.MSWindowsFixedSizeDialogHint, True)
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
@@ -79,33 +84,60 @@ class SearchDialog(QDialog):
 
         date_row = QHBoxLayout()
         _sentinel = QDate(1900, 1, 1)
+
+        def _configure_date_edit(w: QDateEdit) -> None:
+            w.setCalendarPopup(False)
+            w.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            w.setDisplayFormat("yyyy-MM-dd")
+            w.setMinimumDate(_sentinel)
+            w.setSpecialValueText("—")
+            w.setDate(_sentinel)
+
         self._date_from_edit = QDateEdit()
-        self._date_from_edit.setCalendarPopup(True)
-        self._date_from_edit.setDisplayFormat("yyyy-MM-dd")
-        self._date_from_edit.setMinimumDate(_sentinel)
-        self._date_from_edit.setSpecialValueText("—")
-        self._date_from_edit.setDate(_sentinel)
-        self._date_clear_from = QPushButton("Clear")
+        _configure_date_edit(self._date_from_edit)
+
+        self._date_cal_from = QPushButton()
+        self._date_cal_from.setProperty("class", "icon-btn")
+        self._date_cal_from.setFixedSize(28, 28)
+        self._date_cal_from.setIcon(load_icon("calendar"))
+        self._date_cal_from.setIconSize(QSize(16, 16))
+        self._date_cal_from.setToolTip("Pick date")
+        self._date_cal_from.clicked.connect(
+            lambda: self._open_calendar_popup(self._date_from_edit, self._date_cal_from)
+        )
+
+        self._date_clear_from = QPushButton("\u00d7")
+        self._date_clear_from.setProperty("class", "icon-btn")
+        self._date_clear_from.setFixedSize(28, 28)
         self._date_clear_from.setToolTip("Clear start date (no lower bound)")
-        self._date_clear_from.setFixedWidth(52)
         self._date_clear_from.clicked.connect(lambda: self._clear_date_edit(self._date_from_edit))
 
         self._date_to_edit = QDateEdit()
-        self._date_to_edit.setCalendarPopup(True)
-        self._date_to_edit.setDisplayFormat("yyyy-MM-dd")
-        self._date_to_edit.setMinimumDate(_sentinel)
-        self._date_to_edit.setSpecialValueText("—")
-        self._date_to_edit.setDate(_sentinel)
-        self._date_clear_to = QPushButton("Clear")
+        _configure_date_edit(self._date_to_edit)
+
+        self._date_cal_to = QPushButton()
+        self._date_cal_to.setProperty("class", "icon-btn")
+        self._date_cal_to.setFixedSize(28, 28)
+        self._date_cal_to.setIcon(load_icon("calendar"))
+        self._date_cal_to.setIconSize(QSize(16, 16))
+        self._date_cal_to.setToolTip("Pick date")
+        self._date_cal_to.clicked.connect(
+            lambda: self._open_calendar_popup(self._date_to_edit, self._date_cal_to)
+        )
+
+        self._date_clear_to = QPushButton("\u00d7")
+        self._date_clear_to.setProperty("class", "icon-btn")
+        self._date_clear_to.setFixedSize(28, 28)
         self._date_clear_to.setToolTip("Clear end date (no upper bound)")
-        self._date_clear_to.setFixedWidth(52)
         self._date_clear_to.clicked.connect(lambda: self._clear_date_edit(self._date_to_edit))
 
         date_row.addWidget(QLabel("From:"))
         date_row.addWidget(self._date_from_edit)
+        date_row.addWidget(self._date_cal_from)
         date_row.addWidget(self._date_clear_from)
         date_row.addWidget(QLabel("To:"))
         date_row.addWidget(self._date_to_edit)
+        date_row.addWidget(self._date_cal_to)
         date_row.addWidget(self._date_clear_to)
         date_row.addStretch()
         form.addRow("Date range:", date_row)
@@ -117,16 +149,37 @@ class SearchDialog(QDialog):
         layout.addLayout(form)
 
         btn_row = QHBoxLayout()
-        save_run_btn = QPushButton("Save & Search")
+        btn_row.addStretch()
+        save_run_btn = QPushButton("Save && Search")
         save_run_btn.setDefault(True)
         save_run_btn.clicked.connect(self._on_save_and_search)
+        close_btn = QPushButton("Close")
+        close_btn.setProperty("class", "secondary")
+        close_btn.clicked.connect(self.accept)
         btn_row.addWidget(save_run_btn)
-        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn)
+        self.adjustSize()
+        self.setFixedSize(self.size())
+
+    def _open_calendar_popup(self, date_edit: QDateEdit, anchor: QWidget) -> None:
+        cal = QCalendarWidget(self)
+        cal.setWindowFlags(Qt.WindowType.Popup)
+        cal.setGridVisible(True)
+        current = date_edit.date()
+        if current == date_edit.minimumDate():
+            cal.setSelectedDate(QDate.currentDate())
+        else:
+            cal.setSelectedDate(current)
+
+        def on_clicked(d: QDate) -> None:
+            date_edit.setDate(d)
+            cal.close()
+
+        cal.clicked.connect(on_clicked)
+        cal.move(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        cal.show()
 
     def _clear_date_edit(self, w: QDateEdit) -> None:
         """Use minimum date as sentinel for 'unset' (shows special value text)."""
