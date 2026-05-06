@@ -1,5 +1,6 @@
 """
-Search dialog: filter by Recipient, Body, date range, attachments, hash; optional 24h chunking.
+Search dialog: filter by Recipient, Body, date range; optional 24h chunking.
+Saved criteria always use attachments=any and no hash filter (UI removed).
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QLineEdit,
     QPushButton,
-    QComboBox,
     QLabel,
     QCheckBox,
     QMessageBox,
@@ -30,8 +30,6 @@ def _criteria_from_form(
     body_filter: str,
     date_from: str,
     date_to: str,
-    has_attachments: str,
-    hash_filter: str,
     chunk_24h: bool,
     search_name: str,
 ) -> Dict[str, Any]:
@@ -40,15 +38,15 @@ def _criteria_from_form(
         "body_filter": body_filter.strip(),
         "date_from": date_from.strip(),
         "date_to": date_to.strip(),
-        "has_attachments": (has_attachments or "any").strip().lower() or "any",
-        "hash_filter": hash_filter.strip(),
+        "has_attachments": "any",
+        "hash_filter": "",
         "chunk_24h": bool(chunk_24h),
         "search_name": (search_name or "Search results").strip() or "Search results",
     }
 
 
 class SearchDialog(QDialog):
-    """Dialog to define search criteria, save searches, and run them (results show in Search Messages tab)."""
+    """Dialog to define search criteria, save, and run (results show in Search Messages tab)."""
 
     run_search_requested = pyqtSignal(dict)  # criteria dict
 
@@ -60,6 +58,11 @@ class SearchDialog(QDialog):
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
+
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("Name for saving this search")
+        form.addRow("Search name:", self._name_edit)
+
         self._to_edit = QLineEdit()
         self._to_edit.setPlaceholderText(
             "Contact name or phone number (comma-separated for multiple)"
@@ -107,34 +110,17 @@ class SearchDialog(QDialog):
         date_row.addStretch()
         form.addRow("Date range:", date_row)
 
-        self._has_attachments_combo = QComboBox()
-        self._has_attachments_combo.addItem("Any", "any")
-        self._has_attachments_combo.addItem("Has attachments", "yes")
-        self._has_attachments_combo.addItem("No attachments", "no")
-        form.addRow("Attachments:", self._has_attachments_combo)
-
-        self._hash_edit = QLineEdit()
-        self._hash_edit.setPlaceholderText("Hash contains...")
-        form.addRow("Hash:", self._hash_edit)
-
         self._chunk_24h_cb = QCheckBox("Group results by 24-hour chunks (midnight to midnight)")
         self._chunk_24h_cb.setChecked(False)
         form.addRow("", self._chunk_24h_cb)
 
-        self._name_edit = QLineEdit()
-        self._name_edit.setPlaceholderText("Name for saving this search")
-        form.addRow("Search name:", self._name_edit)
-
         layout.addLayout(form)
 
         btn_row = QHBoxLayout()
-        run_btn = QPushButton("Run search")
-        run_btn.setDefault(True)
-        run_btn.clicked.connect(self._on_run_search)
-        save_btn = QPushButton("Save search")
-        save_btn.clicked.connect(self._on_save_search)
-        btn_row.addWidget(run_btn)
-        btn_row.addWidget(save_btn)
+        save_run_btn = QPushButton("Save & Search")
+        save_run_btn.setDefault(True)
+        save_run_btn.clicked.connect(self._on_save_and_search)
+        btn_row.addWidget(save_run_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -158,24 +144,17 @@ class SearchDialog(QDialog):
             self._body_edit.text(),
             self._date_to_ymd(self._date_from_edit),
             self._date_to_ymd(self._date_to_edit),
-            self._has_attachments_combo.currentData() or "any",
-            self._hash_edit.text(),
             self._chunk_24h_cb.isChecked(),
             self._name_edit.text(),
         )
 
-    def _on_run_search(self) -> None:
-        criteria = self._get_criteria()
-        criteria["sequence"] = 0  # ad-hoc search
-        self.run_search_requested.emit(criteria)
-
-    def _on_save_search(self) -> None:
+    def _on_save_and_search(self) -> None:
         name = self._name_edit.text().strip()
         if not name:
             QMessageBox.warning(self, "Save search", "Enter a name for this search.")
             return
         criteria = self._get_criteria()
-        add_saved_search(
+        item = add_saved_search(
             self._app_data_root,
             name=name,
             to_filter=criteria["to_filter"],
@@ -186,4 +165,16 @@ class SearchDialog(QDialog):
             hash_filter=criteria["hash_filter"],
             chunk_24h=criteria["chunk_24h"],
         )
-        QMessageBox.information(self, "Saved", f"Search \"{name}\" saved.")
+        run_criteria = {
+            "to_filter": item["to_filter"],
+            "body_filter": item["body_filter"],
+            "date_from": item["date_from"],
+            "date_to": item["date_to"],
+            "has_attachments": item["has_attachments"],
+            "hash_filter": item["hash_filter"],
+            "chunk_24h": item["chunk_24h"],
+            "search_name": item["name"],
+            "sequence": item["sequence"],
+            "search_id": item["id"],
+        }
+        self.run_search_requested.emit(run_criteria)
