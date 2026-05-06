@@ -1,6 +1,6 @@
 """
-Logging setup for iTunes Parser v2.
-Writes to app data root (see app.paths); default %USERPROFILE%\\.itunes_parser_v2\\logs\\itunes_parser_v2.log.
+Logging setup for GURU Mobile Discovery.
+Writes to app data root (see app.paths); log file at <data-root>/logs/guru_mobile_discovery.log.
 """
 
 from __future__ import annotations
@@ -11,18 +11,18 @@ from pathlib import Path
 
 from app.paths import get_app_data_root
 
-LOG_NAME = "itunes_parser_v2"
+LOG_NAME = "guru_mobile_discovery"
 _configured = False
 
 
 def configure_logging() -> None:
-    """Configure the itunes_parser_v2 logger once. Safe to call multiple times; skips if already configured."""
+    """Configure the application logger once. Safe to call multiple times; skips if already configured."""
     global _configured
     if _configured:
         return
     log_dir = get_app_data_root() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "itunes_parser_v2.log"
+    log_file = log_dir / "guru_mobile_discovery.log"
 
     logger = logging.getLogger(LOG_NAME)
     logger.setLevel(logging.DEBUG)
@@ -46,6 +46,6 @@ def configure_logging() -> None:
 
 
 def get_logger() -> logging.Logger:
-    """Return the itunes_parser_v2 logger. Configures logging on first use if not already done."""
+    """Return the application logger. Configures logging on first use if not already done."""
     configure_logging()
     return logging.getLogger(LOG_NAME)

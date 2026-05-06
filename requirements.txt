@@ -1,4 +1,4 @@
-# iTunes Parser v2 - Case-based Windows app
+# GURU Mobile Discovery — case-based Windows app
 # Python 3.9+
 
 PyQt6>=6.4.0

@@ -19,7 +19,7 @@ if not exist "assets\app.ico" (
 )
 
 echo Running PyInstaller...
-python -m PyInstaller itunes_parser_v2.spec --clean --noconfirm
+python -m PyInstaller guru_mobile_discovery.spec --clean --noconfirm
 if errorlevel 1 (
   echo PyInstaller failed.
   exit /b 1

@@ -368,7 +368,7 @@ def export_conversation_to_rsmf(
     boundary = "=-" + secrets.token_urlsafe(16) + "=="
 
     lines: List[str] = [
-        "X-RSMF-Generator: GURU Discovery iTunes Parser",
+        "X-RSMF-Generator: GURU Mobile Discovery",
         f"X-RSMF-Version: {rsmf_version}",
         f"X-RSMF-EventCount: {len(messages)}",
         f"X-RSMF-BeginDate: {_timestamp_for_headers(begin_ts)}",

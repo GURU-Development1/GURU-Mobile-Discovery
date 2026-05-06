@@ -1,1 +1,1 @@
-# Case-based iTunes Backup Parser v2
+# GURU Mobile Discovery — case-based mobile backup review

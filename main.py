@@ -1,6 +1,6 @@
 """
-Entry point for iTunes Parser v2.
-Launches the PyQt6 app (parser is self-contained in app.backup_parser).
+Entry point for GURU Mobile Discovery.
+Launches the PyQt6 app (iOS backup parsing in app.backup_parser).
 """
 
 import sys

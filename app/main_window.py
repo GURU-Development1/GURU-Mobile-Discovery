@@ -1208,9 +1208,10 @@ class MainWindow(QMainWindow):
 
         <h3>Where data is stored</h3>
         <p>By default, all cases, cached messages, and attachments live under
-        <code>%LOCALAPPDATA%\\iTunes Parser v2\\</code> on Windows. To override the location, set the
-        <code>ITUNES_PARSER_V2_DATA</code> environment variable to an absolute path before launching
-        the program.</p>
+        <code>%LOCALAPPDATA%\\GURU Mobile Discovery\\</code> on Windows (existing installs may still
+        use <code>iTunes Parser v2</code> until you migrate the folder). To override the location, set
+        the <code>GURU_MOBILE_DISCOVERY_DATA</code> environment variable to an absolute path before launching
+        the program (the legacy name <code>ITUNES_PARSER_V2_DATA</code> is still accepted).</p>
         """
 
     def _on_about(self) -> None:

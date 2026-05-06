@@ -1,5 +1,5 @@
 """
-Global QSS stylesheet for iTunes Parser v2.
+Global QSS stylesheet for GURU Mobile Discovery.
 
 Refined slate-blue palette with subtle depth, generous spacing, and a small
 SVG icon helper used across MainWindow, MessageViews, and the dialogs.
