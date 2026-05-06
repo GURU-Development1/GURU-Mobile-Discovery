@@ -1,0 +1,15 @@
+# iTunes Parser v2 - Case-based Windows app
+# Python 3.9+
+
+PyQt6>=6.4.0
+msgpack>=1.0.0
+Pillow>=9.0.0
+pillow-heif>=0.21.0
+
+# Backup parser and decryption (self-contained; optional for encrypted backups)
+iphone-backup-decrypt>=0.9.0
+pycryptodome>=3.20.0
+# Windows: IANA timezone data for zoneinfo
+tzdata>=2022.1
+
+# Build / packaging (PyInstaller + Inno Setup): see requirements-dev.txt and build.bat
