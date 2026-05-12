@@ -1,56 +1,51 @@
-"""Generate assets/app.ico (multi-resolution) for the Windows build. Run from project root: python scripts/make_icon.py
+"""Generate assets/app.ico (multi-resolution) from the GURU Mobile Discovery square logo.
 
-Placeholder branding for GURU Mobile Discovery: a bold "G" on the brand-blue background.
-Replace with a designed logo when one is available.
+Run from project root: python scripts/make_icon.py
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
+
+
+SIZES = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+
+
+def _to_square(img: Image.Image) -> Image.Image:
+    """Pad to a square canvas using the top-left corner color (navy brand bg)."""
+    w, h = img.size
+    if w == h:
+        return img
+    side = max(w, h)
+    bg_pixel = img.convert("RGBA").getpixel((0, 0))
+    if not isinstance(bg_pixel, tuple) or len(bg_pixel) < 4:
+        bg = (12, 26, 58, 255)  # brand navy fallback
+    else:
+        r, g, b, _a = bg_pixel[:4]
+        bg = (r, g, b, 255)
+    canvas = Image.new("RGBA", (side, side), bg)
+    canvas.paste(img, ((side - w) // 2, (side - h) // 2), img if img.mode == "RGBA" else None)
+    return canvas
 
 
 def main() -> None:
     root = Path(__file__).resolve().parent.parent
+    src = root / "assets" / "logo" / "guru_logo_square.png"
     out = root / "assets" / "app.ico"
     out.parent.mkdir(parents=True, exist_ok=True)
-    # Brand accent #5B7FA5 from app/style.py
-    bg = (91, 127, 165, 255)
-    sizes = [16, 32, 48, 64, 128, 256]
-    images: list[Image.Image] = []
-    for s in sizes:
-        img = Image.new("RGBA", (s, s), bg)
-        draw = ImageDraw.Draw(img)
-        margin = max(1, s // 16)
-        draw.rounded_rectangle(
-            [margin, margin, s - margin - 1, s - margin - 1],
-            radius=max(2, s // 8),
-            outline=(255, 255, 255, 220),
-            width=max(1, s // 32),
-        )
-        # "G" monogram for GURU Mobile Discovery (readable at small sizes)
-        try:
-            font = ImageFont.truetype("segoeuib.ttf", size=max(10, int(s * 0.62)))
-        except OSError:
-            try:
-                font = ImageFont.truetype("segoeui.ttf", size=max(10, int(s * 0.62)))
-            except OSError:
-                font = ImageFont.load_default()
-        ch = "G"
-        bbox = draw.textbbox((0, 0), ch, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        tx = (s - tw) // 2 - bbox[0]
-        ty = (s - th) // 2 - bbox[1]
-        draw.text((tx, ty), ch, fill=(255, 255, 255, 255), font=font)
-        images.append(img)
 
-    images[0].save(
-        out,
-        format="ICO",
-        sizes=[(im.width, im.height) for im in images],
-        append_images=images[1:],
-    )
-    print(f"Wrote {out}")
+    if not src.is_file():
+        raise FileNotFoundError(f"Source logo not found: {src}")
+
+    base = Image.open(src).convert("RGBA")
+    squared = _to_square(base)
+    largest = max(SIZES, key=lambda s: s[0])
+    if squared.size != largest:
+        squared = squared.resize(largest, resample=Image.Resampling.LANCZOS)
+
+    squared.save(out, format="ICO", sizes=SIZES)
+    print(f"Wrote {out} from {src} ({len(SIZES)} sizes)")
 
 
 if __name__ == "__main__":

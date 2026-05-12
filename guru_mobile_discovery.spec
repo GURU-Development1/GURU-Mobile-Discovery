@@ -58,6 +58,12 @@ if os.path.isdir(_icons_dir):
         if _name.lower().endswith(".svg"):
             _datas.append((os.path.join(_icons_dir, _name), os.path.join("assets", "icons")))
 
+_logo_dir = os.path.join(_spec_dir, "assets", "logo")
+if os.path.isdir(_logo_dir):
+    for _name in os.listdir(_logo_dir):
+        if _name.lower().endswith(".png"):
+            _datas.append((os.path.join(_logo_dir, _name), os.path.join("assets", "logo")))
+
 a = Analysis(
     [os.path.join(_spec_dir, "main.py")],
     pathex=[_spec_dir],

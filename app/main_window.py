@@ -43,7 +43,7 @@ from .import_dialog import ImportBackupDialog
 from .search_dialog import SearchDialog
 from .export_dialog import ExportRsmfDialog
 from .message_views import MessageViews
-from .style import icon as load_icon, icon_path as resolve_icon_path
+from .style import icon as load_icon, logo_path as resolve_logo_path
 from . import cache
 from .import_worker import run_import, extract_attachments_to_cache
 from app.paths import get_app_data_root
@@ -455,26 +455,25 @@ class MainWindow(QMainWindow):
         self._refresh_file_menu_backup_actions()
 
     def _build_empty_placeholder(self) -> QWidget:
-        """Centered icon + heading + subtitle shown when no backup is selected."""
+        """Centered logo + heading + subtitle shown when no backup is selected."""
         w = QWidget()
         outer = QVBoxLayout(w)
         outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.setSpacing(10)
+        outer.setSpacing(14)
 
-        # Icon
-        icon_label = QLabel()
-        msg_icon_path = resolve_icon_path("messages")
-        if msg_icon_path.is_file():
-            pix = QPixmap(str(msg_icon_path))
+        logo_label = QLabel()
+        lockup_path = resolve_logo_path("guru_logo_lockup")
+        if lockup_path.is_file():
+            pix = QPixmap(str(lockup_path))
             if not pix.isNull():
                 pix = pix.scaled(
-                    72, 72,
+                    320, 110,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                icon_label.setPixmap(pix)
-        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.addWidget(icon_label)
+                logo_label.setPixmap(pix)
+        logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        outer.addWidget(logo_label)
 
         title = QLabel("No backup selected")
         title.setProperty("class", "placeholder-title")
@@ -1215,18 +1214,46 @@ class MainWindow(QMainWindow):
         """
 
     def _on_about(self) -> None:
-        QMessageBox.about(
-            self,
-            "About GURU Mobile Discovery",
+        dlg = QDialog(self)
+        dlg.setWindowTitle("About GURU Mobile Discovery")
+        dlg.setModal(True)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 20, 24, 16)
+        layout.setSpacing(14)
+
+        logo_label = QLabel()
+        lockup_path = resolve_logo_path("guru_logo_lockup")
+        if lockup_path.is_file():
+            pix = QPixmap(str(lockup_path))
+            if not pix.isNull():
+                pix = pix.scaled(
+                    360, 120,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                logo_label.setPixmap(pix)
+        logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(logo_label)
+
+        body = QLabel(
             f"""
-            <h3>GURU Mobile Discovery</h3>
-            <p>Version {__version__}</p>
-            <p>Forensic examination tool for mobile-device backups.<br>
+            <p style="text-align:center;">Version {__version__}</p>
+            <p style="text-align:center;">Forensic examination tool for mobile-device backups.<br>
             Organize backups by case, view messages in thread or table form, and search across
             conversations for legal review and discovery.</p>
-            <p>&copy; GURU Discovery</p>
-            """,
+            <p style="text-align:center;">&copy; GURU Discovery</p>
+            """
         )
+        body.setTextFormat(Qt.TextFormat.RichText)
+        body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+
+        dlg.exec()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         iw = self._import_worker

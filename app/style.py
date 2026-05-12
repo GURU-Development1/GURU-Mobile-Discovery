@@ -42,6 +42,14 @@ def icon(name: str) -> QIcon:
     return QIcon(str(p)) if p.is_file() else QIcon()
 
 
+def logo_path(name: str) -> Path:
+    """Resolve a PNG logo path under assets/logo/ (no .png suffix needed)."""
+    base = _resolved_assets_root() / "logo"
+    if name.endswith(".png"):
+        return base / name
+    return base / f"{name}.png"
+
+
 STYLESHEET = """
 /* =========================================================
    Base
