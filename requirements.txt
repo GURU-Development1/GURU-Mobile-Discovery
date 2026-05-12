@@ -12,4 +12,7 @@ pycryptodome>=3.20.0
 # Windows: IANA timezone data for zoneinfo
 tzdata>=2022.1
 
+# Licensing (Keygen)
+requests>=2.31.0
+
 # Build / packaging (PyInstaller + Inno Setup): see requirements-dev.txt and build.bat

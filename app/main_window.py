@@ -298,8 +298,9 @@ class ExtractAttachmentsWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, license_service=None):
         super().__init__()
+        self._license_service = license_service
         self.setWindowTitle("GURU Mobile Discovery — Cases")
         self.setMinimumSize(1000, 600)
         self.resize(1200, 700)
@@ -335,6 +336,14 @@ class MainWindow(QMainWindow):
         help_action.setShortcut("F1")
         help_action.triggered.connect(self._on_help)
         help_menu.addAction(help_action)
+        help_menu.addSeparator()
+        change_license_action = QAction("Change License Key…", self)
+        change_license_action.triggered.connect(self._on_change_license)
+        help_menu.addAction(change_license_action)
+        deactivate_action = QAction("Deactivate This Device…", self)
+        deactivate_action.triggered.connect(self._on_deactivate_license)
+        help_menu.addAction(deactivate_action)
+        help_menu.addSeparator()
         about_action = QAction("About", self)
         about_action.triggered.connect(self._on_about)
         help_menu.addAction(about_action)
@@ -1235,12 +1244,14 @@ class MainWindow(QMainWindow):
         logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(logo_label)
 
+        license_html = self._license_info_html()
         body = QLabel(
             f"""
             <p style="text-align:center;">Version {__version__}</p>
             <p style="text-align:center;">Forensic examination tool for mobile-device backups.<br>
             Organize backups by case, view messages in thread or table form, and search across
             conversations for legal review and discovery.</p>
+            {license_html}
             <p style="text-align:center;">&copy; GURU Discovery</p>
             """
         )
@@ -1254,6 +1265,71 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons)
 
         dlg.exec()
+
+    def _license_info_html(self) -> str:
+        svc = self._license_service
+        if svc is None or not svc.is_cached():
+            return ""
+        key = svc.cached_key()
+        masked = key[-4:].rjust(len(key), "•") if key else ""
+        expires = svc.cached_expires_at() or ""
+        expires_short = expires[:10] if expires else "—"
+        return (
+            f'<p style="text-align:center;">Licensed device · key ending '
+            f'<code>{masked}</code><br>Expires: {expires_short}</p>'
+        )
+
+    def _on_change_license(self) -> None:
+        if self._license_service is None:
+            QMessageBox.information(
+                self,
+                "License",
+                "Licensing is not configured for this build.",
+            )
+            return
+        from app.license_dialog import LicenseDialog
+        dlg = LicenseDialog(
+            self._license_service,
+            parent=self,
+            title="Change License Key",
+            prefilled_key=self._license_service.cached_key(),
+            allow_close_without_activation=True,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            QMessageBox.information(
+                self,
+                "License",
+                "License updated for this device.",
+            )
+
+    def _on_deactivate_license(self) -> None:
+        if self._license_service is None or not self._license_service.is_cached():
+            QMessageBox.information(
+                self,
+                "Deactivate license",
+                "No license is active on this device.",
+            )
+            return
+        ok = QMessageBox.question(
+            self,
+            "Deactivate this device",
+            "Deactivate this device's license? You will need to re-enter your key to use the "
+            "app again, and the seat will be freed for use on another device.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+        if not ok:
+            return
+        success, msg = self._license_service.deactivate()
+        if not success:
+            QMessageBox.warning(self, "Deactivate license", msg)
+            return
+        QMessageBox.information(
+            self,
+            "Deactivated",
+            "This device has been deactivated. The app will now close.",
+        )
+        QApplication.quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         iw = self._import_worker
