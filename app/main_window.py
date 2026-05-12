@@ -368,7 +368,7 @@ class MainWindow(QMainWindow):
         self._tree.setHeaderHidden(True)
         self._tree.setItemsExpandable(True)
         self._tree.setRootIsDecorated(False)
-        # Default indentation nests backup rows under the case; 0 made children align with parents.
+        self._tree.setIndentation(0)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         self._tree.itemClicked.connect(self._on_tree_item_clicked)
