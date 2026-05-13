@@ -5,6 +5,7 @@ entry from the Help menu.
 
 from __future__ import annotations
 
+import webbrowser
 from typing import Optional, Tuple
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -20,6 +21,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from app.license_config import BUY_URL, has_buy_url
 from app.license_service import LicenseService, LicenseStatus
 from app.style import logo_path as resolve_logo_path
 
@@ -108,6 +110,22 @@ class LicenseDialog(QDialog):
         self._error_label.setVisible(False)
         outer.addWidget(self._error_label)
 
+        if has_buy_url():
+            buy_row = QHBoxLayout()
+            buy_row.addStretch()
+            buy_link = QLabel(
+                f"Don't have a license? <a href=\"{BUY_URL}\">Buy one</a>"
+            )
+            buy_link.setTextFormat(Qt.TextFormat.RichText)
+            buy_link.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextBrowserInteraction
+            )
+            buy_link.setOpenExternalLinks(False)
+            buy_link.linkActivated.connect(self._on_buy_clicked)
+            buy_row.addWidget(buy_link)
+            buy_row.addStretch()
+            outer.addLayout(buy_row)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self._activate_btn = QPushButton("Activate")
@@ -159,6 +177,10 @@ class LicenseDialog(QDialog):
     def _show_error(self, text: str) -> None:
         self._error_label.setText(text)
         self._error_label.setVisible(True)
+
+    def _on_buy_clicked(self, _link: str) -> None:
+        if BUY_URL:
+            webbrowser.open(BUY_URL, new=2)
 
     # Disable close-via-X when the dialog gates launch, so the only escape is "Quit".
     def closeEvent(self, event):  # type: ignore[override]
