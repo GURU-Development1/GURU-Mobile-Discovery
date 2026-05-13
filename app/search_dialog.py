@@ -6,7 +6,7 @@ Saved criteria always use attachments=any and no hash filter (UI removed).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from PyQt6.QtWidgets import (
     QDialog,
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLabel,
     QCheckBox,
+    QComboBox,
     QMessageBox,
     QDateEdit,
     QCalendarWidget,
@@ -25,7 +26,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QDate, Qt, QSize, pyqtSignal
 
-from app.saved_searches import add_saved_search
+from app.saved_searches import add_saved_search, load_folders, walk_folders_depth_first
 from app.style import icon as load_icon
 
 
@@ -54,7 +55,7 @@ class SearchDialog(QDialog):
 
     run_search_requested = pyqtSignal(dict)  # criteria dict
 
-    def __init__(self, app_data_root: Path, parent=None):
+    def __init__(self, app_data_root: Path, parent=None, default_folder_id: Optional[str] = None):
         super().__init__(parent)
         self._app_data_root = Path(app_data_root)
         self.setWindowTitle("Search messages")
@@ -67,6 +68,18 @@ class SearchDialog(QDialog):
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText("Name for saving this search")
         form.addRow("Search name:", self._name_edit)
+
+        self._folder_combo = QComboBox()
+        self._folder_combo.addItem("(No folder)", None)
+        folders = load_folders(self._app_data_root)
+        select_index = 0
+        for i, (folder, depth) in enumerate(walk_folders_depth_first(folders), start=1):
+            label = ("    " * depth) + (folder.get("name") or "Unnamed folder")
+            self._folder_combo.addItem(label, folder.get("id"))
+            if default_folder_id and folder.get("id") == default_folder_id:
+                select_index = i
+        self._folder_combo.setCurrentIndex(select_index)
+        form.addRow("Folder:", self._folder_combo)
 
         self._to_edit = QLineEdit()
         self._to_edit.setPlaceholderText(
@@ -207,6 +220,7 @@ class SearchDialog(QDialog):
             QMessageBox.warning(self, "Save search", "Enter a name for this search.")
             return
         criteria = self._get_criteria()
+        folder_id = self._folder_combo.currentData()
         item = add_saved_search(
             self._app_data_root,
             name=name,
@@ -217,6 +231,7 @@ class SearchDialog(QDialog):
             has_attachments=criteria["has_attachments"],
             hash_filter=criteria["hash_filter"],
             chunk_24h=criteria["chunk_24h"],
+            folder_id=folder_id,
         )
         run_criteria = {
             "to_filter": item["to_filter"],

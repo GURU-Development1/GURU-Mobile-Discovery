@@ -317,21 +317,19 @@ def _build_extracted_text(messages: List[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def export_conversation_to_rsmf(
+def _build_rsmf_bytes(
     conversation_id: str,
     messages: List[dict],
     attachment_base: Optional[Path],
-    output_path: Path,
     custodian: str = "",
     rsmf_version: str = "1.0.0",
     include_control_number: bool = True,
     include_is_deleted: bool = True,
     include_attachments: bool = True,
-    progress_cb: Optional[Callable[[str], None]] = None,
-) -> Optional[Path]:
+) -> Optional[bytes]:
     """
-    Export one conversation (messages with same conversation_id) to a single .rsmf file.
-    Returns the output path on success, None on failure.
+    Build the RFC 5322 body of one conversation's .rsmf file as raw bytes.
+    Shared by both the per-file and the zip-bundle export paths.
     """
     if not messages:
         return None
@@ -345,7 +343,7 @@ def export_conversation_to_rsmf(
     )
     extracted_text = _build_extracted_text(messages)
 
-    # Build rsmf.zip in memory
+    # Build the inner rsmf.zip (manifest + attachments) in memory
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("rsmf_manifest.json", json.dumps(manifest, indent=2))
@@ -359,7 +357,6 @@ def export_conversation_to_rsmf(
     zip_bytes = zip_buffer.getvalue()
     zip_b64 = base64.b64encode(zip_bytes).decode("ascii")
 
-    # RFC 5322 headers
     timestamps = [m.get("date_timestamp") or m.get("date") for m in messages if m.get("date_timestamp") or m.get("date")]
     begin_ts = min(timestamps) if timestamps else None
     end_ts = max(timestamps) if timestamps else None
@@ -400,14 +397,43 @@ def export_conversation_to_rsmf(
         "",
     ])
     body = "\r\n".join(lines)
-    # Fold long base64 lines per RFC 2045 (76 chars max)
     for i in range(0, len(zip_b64), 76):
         body += "\r\n" + zip_b64[i : i + 76]
     body += "\r\n\r\n" + f"--{boundary}--\r\n"
+    return body.encode("utf-8")
 
+
+def export_conversation_to_rsmf(
+    conversation_id: str,
+    messages: List[dict],
+    attachment_base: Optional[Path],
+    output_path: Path,
+    custodian: str = "",
+    rsmf_version: str = "1.0.0",
+    include_control_number: bool = True,
+    include_is_deleted: bool = True,
+    include_attachments: bool = True,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Optional[Path]:
+    """
+    Export one conversation (messages with same conversation_id) to a single .rsmf file.
+    Returns the output path on success, None on failure.
+    """
+    body = _build_rsmf_bytes(
+        conversation_id,
+        messages,
+        attachment_base,
+        custodian=custodian,
+        rsmf_version=rsmf_version,
+        include_control_number=include_control_number,
+        include_is_deleted=include_is_deleted,
+        include_attachments=include_attachments,
+    )
+    if body is None:
+        return None
     out_path = output_path / f"{_sanitize_filename(conversation_id)}.rsmf"
     try:
-        out_path.write_bytes(body.encode("utf-8"))
+        out_path.write_bytes(body)
         if progress_cb:
             progress_cb(str(out_path))
         return out_path
@@ -415,29 +441,14 @@ def export_conversation_to_rsmf(
         return None
 
 
-def export_search_results_to_rsmf(
-    messages: List[dict],
-    attachment_base: Optional[Path],
-    output_dir: Path,
-    custodian: str = "",
-    rsmf_version: str = "1.0.0",
-    include_control_number: bool = True,
-    include_is_deleted: bool = True,
-    include_attachments: bool = True,
-    progress_cb: Optional[Callable[[float, str], None]] = None,
-) -> List[Path]:
-    """
-    Group messages by conversation_id and export each to a .rsmf file.
-    Returns list of output paths.
-    """
-    if progress_cb:
-        progress_cb(0, f"Grouping {len(messages)} messages by conversation...")
+def _group_by_conversation_id(messages: List[dict]) -> Dict[str, List[dict]]:
+    """Group messages by conversation_id, falling back to a deterministic id when missing."""
     cid_to_msgs: Dict[str, List[dict]] = {}
     for m in messages:
         cid = m.get("conversation_id") or ""
         if not cid:
-            # Fallback when conversation_id missing: use deterministic ID from chat+date so filenames are unique.
-            # This can happen if export is run without search results. Run a saved search before exporting for correct IDs (0001..., 0002..., etc.).
+            # Fallback when conversation_id missing (e.g. export without a saved search):
+            # build a deterministic id from chat + date so filenames stay unique.
             chat_id = m.get("chat_id", "")
             ts = m.get("date_timestamp") or m.get("date") or 0
             try:
@@ -450,41 +461,106 @@ def export_search_results_to_rsmf(
                 ymd = "nodate"
             cid = f"0000_{hashlib.md5(f'{chat_id}_{ymd}'.encode()).hexdigest()[:16]}"
         cid_to_msgs.setdefault(cid, []).append(m)
+    return cid_to_msgs
+
+
+def _sanitize_zip_member_name(name: str, used: set) -> str:
+    """Make a .rsmf member name unique inside the output ZIP."""
+    base = _sanitize_filename(name)
+    candidate = f"{base}.rsmf"
+    if candidate not in used:
+        used.add(candidate)
+        return candidate
+    i = 1
+    while f"{base}_{i}.rsmf" in used:
+        i += 1
+    candidate = f"{base}_{i}.rsmf"
+    used.add(candidate)
+    return candidate
+
+
+def export_search_results_to_rsmf(
+    messages: List[dict],
+    attachment_base: Optional[Path],
+    output_dir: Path,
+    custodian: str = "",
+    rsmf_version: str = "1.0.0",
+    include_control_number: bool = True,
+    include_is_deleted: bool = True,
+    include_attachments: bool = True,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    zip_name: Optional[str] = None,
+) -> List[Path]:
+    """
+    Group messages by conversation_id and bundle all .rsmf files into a single
+    ZIP archive inside output_dir. Returns [zip_path] on success, [] on failure.
+
+    The ZIP filename is `zip_name` (sanitized, .zip extension auto-appended) if
+    provided, otherwise `rsmf_export_<YYYYMMDD_HHMMSS>.zip`.
+    """
+    if progress_cb:
+        progress_cb(0, f"Grouping {len(messages)} messages by conversation...")
+    cid_to_msgs = _group_by_conversation_id(messages)
     total = len(cid_to_msgs)
-    if progress_cb and total:
-        progress_cb(0, f"Exporting {total} conversation(s) to RSMF...")
-    done = 0
-    out_paths: List[Path] = []
-    for cid, msgs in cid_to_msgs.items():
-        msgs_sorted = sorted(msgs, key=lambda x: (float(x.get("date_timestamp") or x.get("date") or 0), x.get("rowid") or 0))
-        att_count = sum(len(m.get("attachments") or []) for m in msgs_sorted)
-        short_id = (cid[:40] + "...") if len(cid) > 40 else cid
-        current = done + 1
-        if progress_cb:
-            progress_cb(
-                100 * done / total if total else 0,
-                f"Building RSMF {current}/{total}: {short_id} ({len(msgs_sorted)} messages, {att_count} attachments)",
-            )
+    if not total:
+        return []
 
-        def _per_conv_progress(pth: str, _cur: int = current) -> None:
-            if progress_cb and total:
-                progress_cb(100 * _cur / total, f"Wrote {Path(pth).name}")
+    if zip_name:
+        zip_stem = _sanitize_filename(zip_name)
+        if zip_stem.lower().endswith(".zip"):
+            zip_stem = zip_stem[:-4]
+    else:
+        zip_stem = f"rsmf_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    zip_path = output_dir / f"{zip_stem}.zip"
 
-        p = export_conversation_to_rsmf(
-            cid,
-            msgs_sorted,
-            attachment_base,
-            output_dir,
-            custodian=custodian,
-            rsmf_version=rsmf_version,
-            include_control_number=include_control_number,
-            include_is_deleted=include_is_deleted,
-            include_attachments=include_attachments,
-            progress_cb=_per_conv_progress,
-        )
-        if p:
-            out_paths.append(p)
-        done += 1
-        if progress_cb and total:
-            progress_cb(100 * done / total, f"Exported {done}/{total} conversations")
-    return out_paths
+    if progress_cb:
+        progress_cb(0, f"Bundling {total} conversation(s) into {zip_path.name}...")
+
+    used_names: set = set()
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            done = 0
+            for cid, msgs in cid_to_msgs.items():
+                msgs_sorted = sorted(
+                    msgs,
+                    key=lambda x: (
+                        float(x.get("date_timestamp") or x.get("date") or 0),
+                        x.get("rowid") or 0,
+                    ),
+                )
+                att_count = sum(len(m.get("attachments") or []) for m in msgs_sorted)
+                short_id = (cid[:40] + "...") if len(cid) > 40 else cid
+                current = done + 1
+                if progress_cb:
+                    progress_cb(
+                        100 * done / total,
+                        f"Building RSMF {current}/{total}: {short_id} "
+                        f"({len(msgs_sorted)} messages, {att_count} attachments)",
+                    )
+                body = _build_rsmf_bytes(
+                    cid,
+                    msgs_sorted,
+                    attachment_base,
+                    custodian=custodian,
+                    rsmf_version=rsmf_version,
+                    include_control_number=include_control_number,
+                    include_is_deleted=include_is_deleted,
+                    include_attachments=include_attachments,
+                )
+                if body is None:
+                    done += 1
+                    continue
+                member_name = _sanitize_zip_member_name(cid, used_names)
+                zf.writestr(member_name, body)
+                done += 1
+                if progress_cb:
+                    progress_cb(
+                        100 * done / total,
+                        f"Added {member_name} ({done}/{total})",
+                    )
+    except OSError:
+        return []
+
+    if progress_cb:
+        progress_cb(100, f"Wrote {zip_path.name} ({total} conversation(s))")
+    return [zip_path]

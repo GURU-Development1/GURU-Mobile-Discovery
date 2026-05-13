@@ -43,9 +43,9 @@ class ExportWorker(QThread):
         output_dir: Path,
         custodian: str,
         rsmf_version: str = "1.0.0",
-        include_control_number: bool = True,
         include_is_deleted: bool = True,
         include_attachments: bool = True,
+        zip_name: Optional[str] = None,
     ):
         super().__init__()
         self._messages = messages
@@ -53,9 +53,9 @@ class ExportWorker(QThread):
         self._output_dir = output_dir
         self._custodian = custodian
         self._rsmf_version = rsmf_version
-        self._include_control_number = include_control_number
         self._include_is_deleted = include_is_deleted
         self._include_attachments = include_attachments
+        self._zip_name = zip_name
 
     def run(self) -> None:
         try:
@@ -67,10 +67,11 @@ class ExportWorker(QThread):
                 self._output_dir,
                 custodian=self._custodian,
                 rsmf_version=self._rsmf_version,
-                include_control_number=self._include_control_number,
+                include_control_number=False,
                 include_is_deleted=self._include_is_deleted,
                 include_attachments=self._include_attachments,
                 progress_cb=on_progress,
+                zip_name=self._zip_name,
             )
             self.export_finished.emit(paths)
         except Exception as e:
@@ -125,9 +126,6 @@ class ExportRsmfDialog(QDialog):
 
         # Optional field toggles
         layout.addWidget(QLabel("Include in export:"))
-        self._include_control_number_cb = QCheckBox("Control Number")
-        self._include_control_number_cb.setChecked(True)
-        layout.addWidget(self._include_control_number_cb)
         self._include_is_deleted_cb = QCheckBox("Is Deleted")
         has_deleted = any(m.get("is_deleted") for m in messages)
         self._include_is_deleted_cb.setChecked(has_deleted)
@@ -181,7 +179,6 @@ class ExportRsmfDialog(QDialog):
             output_dir,
             custodian,
             rsmf_version=rsmf_version,
-            include_control_number=self._include_control_number_cb.isChecked(),
             include_is_deleted=self._include_is_deleted_cb.isChecked(),
             include_attachments=self._include_attachments_cb.isChecked(),
         )
@@ -205,11 +202,18 @@ class ExportRsmfDialog(QDialog):
         if w:
             w.deleteLater()
         self.export_completed.emit(paths)
-        QMessageBox.information(
-            self,
-            "Export complete",
-            f"Exported {len(paths)} RSMF file(s) to the selected folder.",
-        )
+        if paths:
+            QMessageBox.information(
+                self,
+                "Export complete",
+                f"Wrote {paths[0].name} to the selected folder.",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Export complete",
+                "Export finished but no RSMF archive was produced.",
+            )
         self.accept()
 
     def _on_export_error(self, err: str) -> None:

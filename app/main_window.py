@@ -42,6 +42,7 @@ from PyQt6.QtGui import QAction, QCloseEvent, QMouseEvent, QIcon, QPixmap
 from .import_dialog import ImportBackupDialog
 from .search_dialog import SearchDialog
 from .export_dialog import ExportRsmfDialog
+from .thread_export_dialog import ThreadExportDialog
 from .message_views import MessageViews
 from .style import icon as load_icon, logo_path as resolve_logo_path
 from . import cache
@@ -403,6 +404,7 @@ class MainWindow(QMainWindow):
         self._message_views.add_search_requested.connect(self._open_search_dialog)
         self._message_views.run_saved_search_requested.connect(self._run_search)
         self._message_views.export_rsmf_requested.connect(self._open_export_rsmf_dialog)
+        self._message_views.export_thread_rsmf_requested.connect(self._open_export_thread_dialog)
         self._message_views.full_table_tab_loaded.connect(self._on_full_table_tab_loaded)
         msg_panel_layout.addWidget(self._message_views)
         self._stack.addWidget(self._message_panel)
@@ -922,11 +924,11 @@ class MainWindow(QMainWindow):
         self._extract_attachments_worker = worker
         worker.start()
 
-    def _open_search_dialog(self) -> None:
+    def _open_search_dialog(self, default_folder_id=None) -> None:
         if not self._current_backup_id:
             QMessageBox.warning(self, "Search", "Load a backup first by selecting it in the tree.")
             return
-        dlg = SearchDialog(self._app_data_root, self)
+        dlg = SearchDialog(self._app_data_root, self, default_folder_id=default_folder_id)
         dlg.run_search_requested.connect(self._run_search)
         dlg.exec()
         self._message_views.refresh_saved_searches_list()
@@ -953,6 +955,26 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         dlg.exec()
+
+    def _open_export_thread_dialog(self, chat_rowid: int) -> None:
+        if not self._current_backup_id:
+            QMessageBox.warning(self, "Export thread", "Load a backup first.")
+            return
+        chat_msgs = self._message_views.get_messages_for_chat(int(chat_rowid))
+        if not chat_msgs:
+            QMessageBox.warning(self, "Export thread", "Select a thread with messages first.")
+            return
+        attach_base = cache.get_backup_cache_root(
+            self._app_data_root, self._current_case_id, self._current_backup_id
+        )
+        ThreadExportDialog(
+            chat_messages=chat_msgs,
+            attachment_base=attach_base,
+            custodian=self._current_custodian,
+            timezone_name=self._current_timezone or "",
+            chat_label=self._message_views.get_current_chat_label(),
+            parent=self,
+        ).exec()
 
     def _run_search(self, criteria: Dict[str, Any]) -> None:
         messages = self._message_views.get_all_messages()

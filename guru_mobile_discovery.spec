@@ -28,6 +28,7 @@ _manual_hidden = [
     "msgpack._cmsgpack",
     "PIL",
     "PIL._imaging",
+    "PyQt6.QtSvg",
     "pillow_heif",
     "iphone_backup_decrypt",
     "iphone_backup_decrypt.google_iphone_dataprotection",

@@ -7,6 +7,8 @@ SVG icon helper used across MainWindow, MessageViews, and the dialogs.
 
 from __future__ import annotations
 
+import base64
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -544,15 +546,27 @@ QCheckBox::indicator:hover {
 }
 
 QCheckBox::indicator:checked {
-    background-color: white;
+    background-color: #4a73b8;
     border: 2px solid #4a73b8;
     border-radius: 4px;
     /*CHECKBOX_IMAGE*/
+    background-repeat: no-repeat;
+    background-position: center;
+}
+
+QCheckBox::indicator:checked:hover {
+    background-color: #3d63a0;
+    border-color: #3d63a0;
 }
 
 QCheckBox::indicator:disabled {
     background-color: #eef1f5;
     border-color: #d6dde6;
+}
+
+QCheckBox::indicator:checked:disabled {
+    background-color: #c9d0db;
+    border-color: #c9d0db;
 }
 
 /* =========================================================
@@ -575,35 +589,137 @@ QSpinBox::up-arrow, QSpinBox::down-arrow {
 """
 
 
+def _svg_to_png_data_uri(
+    svg_text: str,
+    render_size: int,
+    output_size: Optional[int] = None,
+) -> Optional[str]:
+    """Rasterise an SVG (provided as a string) to a PNG and return a base64 data URI.
+
+    render_size: the QImage size (px) to render the SVG into. Use 2x the
+    intended on-screen size for crisper edges on HiDPI displays.
+    output_size: optional final size (px) to scale the rendered image to;
+    defaults to render_size if not provided.
+
+    Returns None if QtSvg is unavailable or rendering fails.
+    """
+    try:
+        from PyQt6.QtCore import QByteArray, QBuffer, QIODevice, Qt
+        from PyQt6.QtGui import QImage, QPainter
+        from PyQt6.QtSvg import QSvgRenderer
+    except ImportError:
+        return None
+
+    renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+    if not renderer.isValid():
+        return None
+
+    img = QImage(render_size, render_size, QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(img)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        renderer.render(painter)
+    finally:
+        painter.end()
+
+    if output_size and output_size != render_size:
+        img = img.scaled(
+            output_size,
+            output_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not img.save(buf, "PNG"):
+        return None
+    b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+# White checkmark, drawn larger so it stays readable inside the 14x14 inner
+# content area of the QCheckBox indicator. Rasterised at 2x for HiDPI.
+_CHECK_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14">'
+    '<path fill="none" stroke="#ffffff" stroke-width="2.6" '
+    'stroke-linecap="round" stroke-linejoin="round" '
+    'd="M2.5 7.4 L5.6 10.2 L11.4 3.6"/>'
+    "</svg>"
+)
+
+
 def get_stylesheet(assets_root: Optional[Path] = None) -> str:
     """
     Return the global stylesheet, with checkbox checkmark and combo dropdown
-    arrow images inlined (when their SVGs are present).
+    arrow images rasterised in-memory and inlined as base64 PNG data URIs.
+
+    PNG data URIs work reliably across all paths (including those with '&')
+    and Qt platform styles. The check image is white-on-blue to be visible
+    against the filled :checked indicator background.
 
     assets_root: project root's assets folder (or PyInstaller _MEIPASS/assets).
     """
-    root = Path(assets_root) if assets_root is not None else _resolved_assets_root()
-
     qss = STYLESHEET
 
-    check = root / "check.svg"
-    if check.is_file():
-        check_uri = check.resolve().as_uri()
+    check_uri = _svg_to_png_data_uri(_CHECK_SVG, render_size=28, output_size=14)
+    if check_uri:
         qss = qss.replace(
             "    /*CHECKBOX_IMAGE*/",
-            f'    image: url("{check_uri}");',
+            f'    background-image: url({check_uri});',
         )
     else:
         qss = qss.replace("    /*CHECKBOX_IMAGE*/", "")
 
-    arrow = root / "icons" / "chevron-down.svg"
-    if arrow.is_file():
-        arrow_uri = arrow.resolve().as_uri()
+    root = Path(assets_root) if assets_root is not None else _resolved_assets_root()
+    arrow_path = root / "icons" / "chevron-down.svg"
+    arrow_uri: Optional[str] = None
+    if arrow_path.is_file():
+        try:
+            arrow_text = arrow_path.read_text(encoding="utf-8")
+            arrow_uri = _svg_to_png_data_uri(arrow_text, render_size=24, output_size=12)
+        except OSError:
+            arrow_uri = None
+    if arrow_uri:
         qss = qss.replace(
             "    /*COMBO_ARROW_IMAGE*/",
-            f'    image: url("{arrow_uri}");',
+            f'    image: url({arrow_uri});',
         )
     else:
         qss = qss.replace("    /*COMBO_ARROW_IMAGE*/", "")
 
     return qss
+
+
+# Backwards-compat shim — kept in case other modules imported it.
+def _svg_to_png_uri(svg_path: Path, size: int) -> Optional[str]:
+    """Deprecated: rasterise an SVG file and write a temp PNG. Prefer the
+    in-memory data-URI helper. Returns a file:// URI."""
+    if not svg_path.is_file():
+        return None
+    try:
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QImage, QPainter
+        from PyQt6.QtSvg import QSvgRenderer
+    except ImportError:
+        return None
+    renderer = QSvgRenderer(str(svg_path))
+    if not renderer.isValid():
+        return None
+    img = QImage(size, size, QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(img)
+    try:
+        renderer.render(painter)
+    finally:
+        painter.end()
+    tmp_dir = Path(tempfile.gettempdir()) / "guru_qss_assets"
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    out_path = tmp_dir / f"{svg_path.stem}_{size}.png"
+    if not img.save(str(out_path), "PNG"):
+        return None
+    return out_path.resolve().as_uri()
