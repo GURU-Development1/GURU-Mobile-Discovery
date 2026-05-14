@@ -933,6 +933,81 @@ class MainWindow(QMainWindow):
         dlg.exec()
         self._message_views.refresh_saved_searches_list()
 
+    def _needs_backup_fallback(self, messages: List[dict], attach_base: Optional[Path]) -> bool:
+        """True if any image attachment in `messages` is missing from the local cache.
+
+        Exports rely on `attach_base / local_path` files for embedding. When an
+        attachment has an empty `local_path`, or that file doesn't exist, the
+        export needs to fall back to reading the bytes from the raw backup.
+        """
+        from app.rsmf_export import _is_image_attachment
+
+        for m in messages or []:
+            for a in m.get("attachments") or []:
+                if not _is_image_attachment(a):
+                    continue
+                lp = (a.get("local_path") or "").strip()
+                if not lp:
+                    return True
+                if attach_base is None:
+                    return True
+                if not (attach_base / lp).exists():
+                    return True
+        return False
+
+    def _resolve_backup_fallback(
+        self,
+        messages: List[dict],
+        attach_base: Optional[Path],
+    ) -> tuple[Optional[str], Optional[str], bool]:
+        """Decide whether the export should embed attachments from the raw backup.
+
+        Returns `(backup_path, passphrase, cancelled)`:
+          - `cancelled` is True if the user dismissed the passphrase prompt;
+            callers should abort the export.
+          - `backup_path` is set only when fallback is needed AND the saved
+            backup folder is still on disk.
+          - `passphrase` is set only for encrypted backups that the user
+            entered a password for.
+        """
+        if not self._needs_backup_fallback(messages, attach_base):
+            return None, None, False
+
+        meta = cache.load_backup_meta(
+            self._app_data_root, self._current_case_id, self._current_backup_id
+        )
+        bp_str = (meta or {}).get("backup_path") if meta else None
+        if not bp_str:
+            return None, None, False
+        bp = Path(bp_str)
+        if not bp.exists():
+            QMessageBox.information(
+                self,
+                "Export RSMF",
+                "Some attachments are not in the local cache and the original "
+                "backup folder is no longer available; those attachments will "
+                "be skipped.",
+            )
+            return None, None, False
+
+        passphrase: Optional[str] = None
+        if backup_appears_encrypted(bp):
+            pw, ok = QInputDialog.getText(
+                self,
+                "Backup password",
+                "This backup is encrypted and some attachments need to be read "
+                "from it during export. Enter the backup password:",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok:
+                return None, None, True
+            pw = (pw or "").strip()
+            if not pw:
+                return None, None, True
+            passphrase = pw
+
+        return str(bp.resolve()), passphrase, False
+
     def _open_export_rsmf_dialog(self) -> None:
         if not self._current_backup_id:
             QMessageBox.warning(self, "Export RSMF", "Load a backup first.")
@@ -948,11 +1023,16 @@ class MainWindow(QMainWindow):
             timezone_name=self._current_timezone or "",
         )
         attach_base = cache.get_backup_cache_root(self._app_data_root, self._current_case_id, self._current_backup_id)
+        backup_path, passphrase, cancelled = self._resolve_backup_fallback(to_export, attach_base)
+        if cancelled:
+            return
         dlg = ExportRsmfDialog(
             to_export,
             attach_base,
             custodian=self._current_custodian,
             parent=self,
+            backup_path=backup_path,
+            passphrase=passphrase,
         )
         dlg.exec()
 
@@ -967,6 +1047,9 @@ class MainWindow(QMainWindow):
         attach_base = cache.get_backup_cache_root(
             self._app_data_root, self._current_case_id, self._current_backup_id
         )
+        backup_path, passphrase, cancelled = self._resolve_backup_fallback(chat_msgs, attach_base)
+        if cancelled:
+            return
         ThreadExportDialog(
             chat_messages=chat_msgs,
             attachment_base=attach_base,
@@ -974,6 +1057,8 @@ class MainWindow(QMainWindow):
             timezone_name=self._current_timezone or "",
             chat_label=self._message_views.get_current_chat_label(),
             parent=self,
+            backup_path=backup_path,
+            passphrase=passphrase,
         ).exec()
 
     def _run_search(self, criteria: Dict[str, Any]) -> None:

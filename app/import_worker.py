@@ -107,21 +107,16 @@ def _extension_from_mime_or_filename(mime: str, filename: str) -> str:
     return ".bin"
 
 
-def _enrich_attachment_for_cache(
-    att: dict,
-    parser: BackupParser,
-    attachments_dir: Path,
-    progress_cb: Optional[Callable[[float, str], None]],
-) -> Optional[tuple[str, bool]]:
-    """
-    Extract attachment to attachments_dir and return (relative_path, is_image) or None.
-    Images: HEIC->JPEG, GIF->PNG still; others saved with original extension.
-    When relative_path is empty, tries candidate paths using attachment guid + filename (iOS).
+def _lookup_attachment_bytes(att: dict, parser: BackupParser) -> Optional[bytes]:
+    """Run the 4-step Manifest/path/guid search for an attachment's raw backup bytes.
+
+    Returns the raw bytes if found, or None. Does NOT do any conversion or
+    write anything to disk. Shared by `_enrich_attachment_for_cache` and the
+    on-the-fly RSMF resolver.
     """
     domain = att.get("domain", "HomeDomain")
     rel = (att.get("relative_path") or "").strip()
-    entry = None
-    data = None
+    data: Optional[bytes] = None
     guid = (att.get("guid") or "").strip()
     fname = (att.get("transfer_name") or att.get("filename") or "").strip() or "image"
     log = get_logger()
@@ -138,13 +133,13 @@ def _enrich_attachment_for_cache(
                 if data:
                     break
         if not data:
-            log.debug("enrich_attachment: get_file_by_path rel=%s -> no data", rel[:60])
+            log.debug("resolve_attachment_bytes: get_file_by_path rel=%s -> no data", rel[:60])
 
     # 2) If we have guid that looks like backup file ID (40-char hex), try direct read by ID
     if not data and guid and len(guid) >= 32 and all(c in "0123456789abcdefABCDEF" for c in guid):
         data = parser.read_file_bytes_by_id(guid)
         if data:
-            log.debug("enrich_attachment: got data by file_id guid=%s len=%d", guid[:12], len(data))
+            log.debug("resolve_attachment_bytes: got data by file_id guid=%s len=%d", guid[:12], len(data))
 
     # 3) Search Manifest for any file whose path ends with this filename (e.g. image000001.jpg)
     if not data and fname:
@@ -155,7 +150,7 @@ def _enrich_attachment_for_cache(
                 if e:
                     data = parser.read_file_bytes(e)
                     if data:
-                        log.debug("enrich_attachment: got data by path ending with %s", fname_base)
+                        log.debug("resolve_attachment_bytes: got data by path ending with %s", fname_base)
                         break
                 if data:
                     break
@@ -209,28 +204,54 @@ def _enrich_attachment_for_cache(
                             break
 
     if not data:
-        log.info("enrich_attachment: failed guid=%s fname=%s reason=no_data_from_candidates", guid, fname)
+        log.info(
+            "resolve_attachment_bytes: failed guid=%s fname=%s reason=no_data_from_candidates",
+            guid,
+            fname,
+        )
         return None
+    return data
+
+
+def resolve_attachment_bytes(
+    att: dict,
+    parser: BackupParser,
+) -> Optional[tuple[bytes, str, bool]]:
+    """Pull an attachment from the raw backup and convert it for RSMF embedding.
+
+    Returns `(image_bytes, suggested_filename, is_image)` or None.
+    - HEIC -> JPEG, GIF -> first-frame PNG, other images stay as-is (.png/.jpg).
+    - Non-image attachments are returned as raw bytes with a best-effort extension.
+
+    Does not write anything to disk. Used by the RSMF export to embed
+    attachments straight from the backup when the cache is empty.
+    """
+    log = get_logger()
+    data = _lookup_attachment_bytes(att, parser)
+    if not data:
+        return None
+
     mime = (att.get("mime_type") or "").lower()
     fn_lower = (att.get("filename") or att.get("transfer_name") or "").lower()
     is_gif = "gif" in mime or fn_lower.endswith(".gif")
     is_image = "image" in mime or is_gif or fn_lower.endswith(
         (".png", ".jpg", ".jpeg", ".heic", ".bmp", ".webp")
     )
-
     key = hashlib.sha256(data).hexdigest()[:12]
+
     if is_gif:
         try:
             from PIL import Image
             img = Image.open(io.BytesIO(data))
-            # First frame as still
             if getattr(img, "n_frames", 1) > 1:
                 img.seek(0)
-            out_path = attachments_dir / f"{key}.png"
-            img.convert("RGB").save(out_path, "PNG")
-            return (f"{ATTACHMENTS_DIR}/{key}.png", True)
-        except Exception:
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, "PNG")
+            return (buf.getvalue(), f"{key}.png", True)
+        except Exception as e:
+            log.info("resolve_attachment_bytes: GIF convert failed: %s", e)
             return None
+
     is_heic = "heic" in mime or ".heic" in fn_lower
     if is_heic:
         try:
@@ -240,25 +261,49 @@ def _enrich_attachment_for_cache(
             img = Image.open(io.BytesIO(data))
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            out_path = attachments_dir / f"{key}.jpg"
-            img.save(out_path, "JPEG", quality=92)
-            return (f"{ATTACHMENTS_DIR}/{key}.jpg", True)
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=92)
+            return (buf.getvalue(), f"{key}.jpg", True)
         except Exception as e:
-            log.info("enrich_attachment: HEIC convert failed for %s: %s", fname, e)
+            log.info("resolve_attachment_bytes: HEIC convert failed: %s", e)
             return None
-    elif is_image:
+
+    if is_image:
         ext = ".png"
         if "jpeg" in mime or "jpg" in mime:
             ext = ".jpg"
-        out_path = attachments_dir / f"{key}{ext}"
+        elif fn_lower.endswith((".jpg", ".jpeg")):
+            ext = ".jpg"
+        return (data, f"{key}{ext}", True)
+
+    ext = _extension_from_mime_or_filename(
+        mime, att.get("filename") or att.get("transfer_name") or ""
+    )
+    return (data, f"{key}{ext}", False)
+
+
+def _enrich_attachment_for_cache(
+    att: dict,
+    parser: BackupParser,
+    attachments_dir: Path,
+    progress_cb: Optional[Callable[[float, str], None]],
+) -> Optional[tuple[str, bool]]:
+    """
+    Extract attachment to attachments_dir and return (relative_path, is_image) or None.
+    Thin wrapper over `resolve_attachment_bytes` that persists the bytes to the
+    on-disk cache.
+    """
+    result = resolve_attachment_bytes(att, parser)
+    if not result:
+        return None
+    data, name, is_image = result
+    out_path = attachments_dir / name
+    try:
         out_path.write_bytes(data)
-        return (f"{ATTACHMENTS_DIR}/{key}{ext}", True)
-    else:
-        # Non-image: save raw bytes with extension from mime or filename
-        ext = _extension_from_mime_or_filename(mime, att.get("filename") or att.get("transfer_name") or "")
-        out_path = attachments_dir / f"{key}{ext}"
-        out_path.write_bytes(data)
-        return (f"{ATTACHMENTS_DIR}/{key}{ext}", False)
+    except OSError as e:
+        get_logger().info("_enrich_attachment_for_cache: write failed for %s: %s", name, e)
+        return None
+    return (f"{ATTACHMENTS_DIR}/{name}", is_image)
 
 
 def _attachment_meta_only(att: dict) -> dict:

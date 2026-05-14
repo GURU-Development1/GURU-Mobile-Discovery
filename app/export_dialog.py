@@ -26,6 +26,7 @@ from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 
 from app.rsmf_export import export_search_results_to_rsmf
 from app.style import icon as load_icon
+from app.logging_config import get_logger
 
 
 class ExportWorker(QThread):
@@ -46,6 +47,8 @@ class ExportWorker(QThread):
         include_is_deleted: bool = True,
         include_attachments: bool = True,
         zip_name: Optional[str] = None,
+        backup_path: Optional[str] = None,
+        passphrase: Optional[str] = None,
     ):
         super().__init__()
         self._messages = messages
@@ -56,8 +59,49 @@ class ExportWorker(QThread):
         self._include_is_deleted = include_is_deleted
         self._include_attachments = include_attachments
         self._zip_name = zip_name
+        self._backup_path = backup_path
+        self._passphrase = passphrase
 
     def run(self) -> None:
+        log = get_logger()
+        parser = None
+        resolver = None
+        tmp_dir = None
+        if self._include_attachments and self._backup_path:
+            try:
+                import tempfile
+                from app.backup_parser import BackupParser
+                from app.import_worker import resolve_attachment_bytes
+
+                tmp_dir = tempfile.mkdtemp(prefix="rsmf_export_")
+                parser = BackupParser(
+                    self._backup_path,
+                    passphrase=self._passphrase,
+                    temp_dir=tmp_dir,
+                )
+
+                def _resolver(att: dict):
+                    try:
+                        res = resolve_attachment_bytes(att, parser)
+                    except Exception as exc:
+                        log.info("ExportWorker resolver error: %s", exc)
+                        return None
+                    if not res:
+                        return None
+                    data, name, is_image = res
+                    if not is_image:
+                        return None
+                    return (data, name)
+
+                resolver = _resolver
+            except Exception as exc:
+                log.info(
+                    "ExportWorker: BackupParser unavailable (%s); export will skip missing attachments",
+                    exc,
+                )
+                parser = None
+                resolver = None
+
         try:
             def on_progress(pct: float, label: str) -> None:
                 self.progress.emit(pct, label)
@@ -72,10 +116,23 @@ class ExportWorker(QThread):
                 include_attachments=self._include_attachments,
                 progress_cb=on_progress,
                 zip_name=self._zip_name,
+                attachment_resolver=resolver,
             )
             self.export_finished.emit(paths)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if parser is not None:
+                try:
+                    parser.close()
+                except Exception:
+                    pass
+            if tmp_dir:
+                try:
+                    import shutil
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
 
 class ExportRsmfDialog(QDialog):
@@ -88,11 +145,15 @@ class ExportRsmfDialog(QDialog):
         attachment_base: Optional[Path],
         custodian: str = "",
         parent=None,
+        backup_path: Optional[str] = None,
+        passphrase: Optional[str] = None,
     ):
         super().__init__(parent)
         self._messages = messages
         self._attachment_base = attachment_base
         self._custodian = custodian
+        self._backup_path = backup_path
+        self._passphrase = passphrase
         self.setWindowTitle("Export RSMF")
         self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
@@ -181,6 +242,8 @@ class ExportRsmfDialog(QDialog):
             rsmf_version=rsmf_version,
             include_is_deleted=self._include_is_deleted_cb.isChecked(),
             include_attachments=self._include_attachments_cb.isChecked(),
+            backup_path=self._backup_path,
+            passphrase=self._passphrase,
         )
         self._progress = QProgressDialog("Exporting RSMF files...", "Cancel", 0, 100, self)
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)

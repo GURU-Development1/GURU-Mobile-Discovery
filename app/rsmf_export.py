@@ -185,8 +185,17 @@ def _build_events(
     include_control_number: bool = True,
     include_is_deleted: bool = True,
     include_attachments: bool = True,
+    attachment_resolver: Optional[Callable[[dict], Optional[tuple]]] = None,
+    zip_attachments_inline: Optional[Dict[str, bytes]] = None,
 ) -> List[dict]:
-    """Build events array with mapped fields; collect attachments for zip."""
+    """Build events array with mapped fields; collect attachments for zip.
+
+    Attachments are sourced in priority order:
+      1. From the extracted cache at `attachment_base / local_path` when the file exists.
+      2. From `attachment_resolver(att)` which returns (bytes, suggested_name) or None.
+         Used as a fallback so RSMF exports still embed attachments when the
+         user hasn't run "Extract Attachments...".
+    """
     events: List[dict] = []
     seen_names: set = set()
     include_direction = rsmf_version == "2.0.0"
@@ -235,23 +244,53 @@ def _build_events(
         att_objs: List[Dict[str, Any]] = []
         if include_attachments:
             for a in m.get("attachments") or []:
-                lp = a.get("local_path")
-                if not lp:
-                    continue
                 if not _is_image_attachment(a):
                     # Skip non-image (MOV, MP4, etc.) - Relativity shows "OBJ" placeholder for these
                     continue
-                if attachment_base:
-                    full = attachment_base / lp
-                    if full.exists():
-                        raw_name = (a.get("transfer_name") or a.get("filename") or lp.split("/")[-1] or "attachment").strip()
-                        zip_name = _unique_zip_name(raw_name)
-                        zip_attachments[zip_name] = str(full)
-                        try:
-                            size = full.stat().st_size
-                        except OSError:
-                            size = 0
-                        att_objs.append({"id": zip_name, "display": zip_name, "size": size})
+                lp = a.get("local_path") or ""
+                cached_full: Optional[Path] = None
+                if lp and attachment_base:
+                    candidate = attachment_base / lp
+                    if candidate.exists():
+                        cached_full = candidate
+
+                if cached_full is not None:
+                    raw_name = (
+                        a.get("transfer_name")
+                        or a.get("filename")
+                        or lp.split("/")[-1]
+                        or "attachment"
+                    ).strip()
+                    zip_name = _unique_zip_name(raw_name)
+                    zip_attachments[zip_name] = str(cached_full)
+                    try:
+                        size = cached_full.stat().st_size
+                    except OSError:
+                        size = 0
+                    att_objs.append({"id": zip_name, "display": zip_name, "size": size})
+                    continue
+
+                # Fallback: pull bytes directly from the raw backup when the cache
+                # is empty or stale. attachment_resolver returns (bytes, suggested_name)
+                # or None when the lookup fails for any reason.
+                if attachment_resolver is None or zip_attachments_inline is None:
+                    continue
+                try:
+                    resolved = attachment_resolver(a)
+                except Exception:
+                    resolved = None
+                if not resolved:
+                    continue
+                data, suggested_name = resolved[0], resolved[1]
+                raw_name = (
+                    a.get("transfer_name")
+                    or a.get("filename")
+                    or suggested_name
+                    or "attachment"
+                ).strip()
+                zip_name = _unique_zip_name(raw_name)
+                zip_attachments_inline[zip_name] = data
+                att_objs.append({"id": zip_name, "display": zip_name, "size": len(data)})
         if att_objs:
             event["attachments"] = att_objs
         events.append(event)
@@ -268,6 +307,8 @@ def _build_rsmf_manifest(
     include_is_deleted: bool = True,
     include_attachments: bool = True,
     custodian: str = "",
+    attachment_resolver: Optional[Callable[[dict], Optional[tuple]]] = None,
+    zip_attachments_inline: Optional[Dict[str, bytes]] = None,
 ) -> dict:
     """Build rsmf_manifest.json structure."""
     participants, display_to_id = _build_participants(messages, custodian)
@@ -279,6 +320,8 @@ def _build_rsmf_manifest(
         include_control_number=include_control_number,
         include_is_deleted=include_is_deleted,
         include_attachments=include_attachments,
+        attachment_resolver=attachment_resolver,
+        zip_attachments_inline=zip_attachments_inline,
     )
     to_display = conversation_id
     is_group = len(participants) > 2
@@ -326,6 +369,7 @@ def _build_rsmf_bytes(
     include_control_number: bool = True,
     include_is_deleted: bool = True,
     include_attachments: bool = True,
+    attachment_resolver: Optional[Callable[[dict], Optional[tuple]]] = None,
 ) -> Optional[bytes]:
     """
     Build the RFC 5322 body of one conversation's .rsmf file as raw bytes.
@@ -334,12 +378,15 @@ def _build_rsmf_bytes(
     if not messages:
         return None
     zip_attachments: Dict[str, str] = {}
+    zip_attachments_inline: Dict[str, bytes] = {}
     manifest = _build_rsmf_manifest(
         conversation_id, messages, attachment_base, zip_attachments, rsmf_version,
         include_control_number=include_control_number,
         include_is_deleted=include_is_deleted,
         include_attachments=include_attachments,
         custodian=custodian,
+        attachment_resolver=attachment_resolver,
+        zip_attachments_inline=zip_attachments_inline,
     )
     extracted_text = _build_extracted_text(messages)
 
@@ -351,6 +398,11 @@ def _build_rsmf_bytes(
             try:
                 with open(filepath, "rb") as f:
                     data = f.read()
+                zf.writestr(zip_name, data)
+            except Exception:
+                pass
+        for zip_name, data in zip_attachments_inline.items():
+            try:
                 zf.writestr(zip_name, data)
             except Exception:
                 pass
@@ -414,6 +466,7 @@ def export_conversation_to_rsmf(
     include_is_deleted: bool = True,
     include_attachments: bool = True,
     progress_cb: Optional[Callable[[str], None]] = None,
+    attachment_resolver: Optional[Callable[[dict], Optional[tuple]]] = None,
 ) -> Optional[Path]:
     """
     Export one conversation (messages with same conversation_id) to a single .rsmf file.
@@ -428,6 +481,7 @@ def export_conversation_to_rsmf(
         include_control_number=include_control_number,
         include_is_deleted=include_is_deleted,
         include_attachments=include_attachments,
+        attachment_resolver=attachment_resolver,
     )
     if body is None:
         return None
@@ -490,6 +544,7 @@ def export_search_results_to_rsmf(
     include_attachments: bool = True,
     progress_cb: Optional[Callable[[float, str], None]] = None,
     zip_name: Optional[str] = None,
+    attachment_resolver: Optional[Callable[[dict], Optional[tuple]]] = None,
 ) -> List[Path]:
     """
     Group messages by conversation_id and bundle all .rsmf files into a single
@@ -546,6 +601,7 @@ def export_search_results_to_rsmf(
                     include_control_number=include_control_number,
                     include_is_deleted=include_is_deleted,
                     include_attachments=include_attachments,
+                    attachment_resolver=attachment_resolver,
                 )
                 if body is None:
                     done += 1

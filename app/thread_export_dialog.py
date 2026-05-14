@@ -56,12 +56,16 @@ class ThreadExportDialog(QDialog):
         timezone_name: str = "",
         chat_label: str = "",
         parent=None,
+        backup_path: Optional[str] = None,
+        passphrase: Optional[str] = None,
     ):
         super().__init__(parent)
         self._chat_messages = list(chat_messages)
         self._attachment_base = attachment_base
         self._timezone_name = timezone_name or ""
         self._chat_label = chat_label or ""
+        self._backup_path = backup_path
+        self._passphrase = passphrase
         self._worker: Optional[ExportWorker] = None
         self._progress: Optional[QProgressDialog] = None
 
@@ -284,6 +288,8 @@ class ThreadExportDialog(QDialog):
             include_is_deleted=self._include_is_deleted_cb.isChecked(),
             include_attachments=self._include_attachments_cb.isChecked(),
             zip_name=zip_name,
+            backup_path=self._backup_path,
+            passphrase=self._passphrase,
         )
         self._progress = QProgressDialog("Exporting RSMF files...", "Cancel", 0, 100, self)
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
