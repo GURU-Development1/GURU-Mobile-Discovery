@@ -242,24 +242,33 @@ QComboBox QAbstractItemView {
 /* =========================================================
    Tree widget
    ========================================================= */
+/* Whole-row selection needs square corners on ::item; rounded rects plus native branch painting leave a visible white gutter between the branch column and the label on Windows. */
 QTreeWidget {
     background-color: #ffffff;
     border: 1px solid #e1e6ed;
     border-radius: 8px;
     padding: 6px;
     outline: none;
-    show-decoration-selected: 0;
+    show-decoration-selected: 1;
+    selection-background-color: #4a73b8;
+    selection-color: #ffffff;
 }
 
 QTreeWidget::item {
     padding: 7px 10px;
-    border-radius: 5px;
-    margin: 1px 0;
+    border-radius: 0;
+    margin: 0;
+    border: none;
     color: #1f2937;
 }
 
 QTreeWidget::item:hover {
     background-color: #eaf0f8;
+}
+
+QTreeWidget::item:selected:hover {
+    background-color: #4a73b8;
+    color: white;
 }
 
 QTreeWidget::item:selected {
@@ -270,6 +279,24 @@ QTreeWidget::item:selected {
 QTreeWidget::item:selected:!active {
     background-color: #4a73b8;
     color: white;
+}
+
+QTreeWidget::branch {
+    background-color: transparent;
+    border-image: none;
+    image: none;
+}
+
+QTreeWidget::branch:hover {
+    background-color: #eaf0f8;
+}
+
+QTreeWidget::branch:selected {
+    background-color: #4a73b8;
+}
+
+QTreeWidget::branch:selected:hover {
+    background-color: #4a73b8;
 }
 
 QHeaderView::section {

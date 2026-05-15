@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStackedWidget,
+    QStyleFactory,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -38,10 +39,12 @@ from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QRect
 from PyQt6.QtGui import QPainter, QPixmap, QWheelEvent
 
 from app.saved_searches import (
+    LIBRARY_ROOT_FOLDER_ID,
     add_folder,
     delete_folder_cascade,
     delete_saved_search,
     descendant_search_count,
+    is_library_root_folder_id,
     load_folders,
     load_saved_searches,
     move_folder,
@@ -501,6 +504,13 @@ class SavedSearchesTree(QTreeWidget):
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._app_data_root: Optional[Path] = None
+        # Native Windows style paints branch decorations in a rect separate from QSS-styled
+        # ::item backgrounds (often leaves a white gutter beside rounded selections).
+        # Fusion honors show-decoration-selected + QSS more uniformly.
+        _fusion = QStyleFactory.create("Fusion")
+        if _fusion is not None:
+            _fusion.setParent(self)
+            self.setStyle(_fusion)
 
     def set_app_data_root(self, p: Optional[Path]) -> None:
         self._app_data_root = p
@@ -519,32 +529,36 @@ class SavedSearchesTree(QTreeWidget):
             return
         src_kind, src_id = src_data
 
+        # The library root folder is fixed at the top and cannot be reparented.
+        if src_kind == "folder" and is_library_root_folder_id(src_id):
+            event.ignore()
+            return
+
         target = self.itemAt(event.position().toPoint())
         indicator = self.dropIndicatorPosition()
 
+        def _parent_folder_id(item) -> str:
+            parent = item.parent()
+            if parent is None:
+                return LIBRARY_ROOT_FOLDER_ID
+            pd = parent.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(pd, tuple) and pd[0] == "folder":
+                return pd[1]
+            return LIBRARY_ROOT_FOLDER_ID
+
         if target is None:
-            target_folder_id: Optional[str] = None
+            target_folder_id = LIBRARY_ROOT_FOLDER_ID
         else:
             tgt_data = target.data(0, Qt.ItemDataRole.UserRole)
             tgt_kind = tgt_data[0] if isinstance(tgt_data, tuple) else None
             tgt_id = tgt_data[1] if isinstance(tgt_data, tuple) else None
-            if indicator == QAbstractItemView.DropIndicatorPosition.OnItem:
-                if tgt_kind == "folder":
-                    target_folder_id = tgt_id
-                else:
-                    parent = target.parent()
-                    if parent is None:
-                        target_folder_id = None
-                    else:
-                        pd = parent.data(0, Qt.ItemDataRole.UserRole)
-                        target_folder_id = pd[1] if isinstance(pd, tuple) else None
+            if (
+                indicator == QAbstractItemView.DropIndicatorPosition.OnItem
+                and tgt_kind == "folder"
+            ):
+                target_folder_id = tgt_id
             else:
-                parent = target.parent()
-                if parent is None:
-                    target_folder_id = None
-                else:
-                    pd = parent.data(0, Qt.ItemDataRole.UserRole)
-                    target_folder_id = pd[1] if isinstance(pd, tuple) else None
+                target_folder_id = _parent_folder_id(target)
 
         if src_kind == "folder":
             if move_folder(self._app_data_root, src_id, target_folder_id) is None:
@@ -623,25 +637,12 @@ class MessageViews(QWidget):
         self._table_view = TableView()
         table_layout.addWidget(self._table_view, 1)
         self._table_tab_index = self._tabs.addTab(table_tab, "Table View")
-        # Tab 2: Search — left = Add Search / New Folder buttons + saved searches tree, right = results table
+        # Tab 2: Search — left = saved searches tree (right-click folders to add searches/subfolders), right = results table
         search_tab = QWidget()
         search_splitter = QSplitter(Qt.Orientation.Horizontal)
         search_left = QWidget()
         search_left_layout = QVBoxLayout(search_left)
         search_left_layout.setContentsMargins(0, 0, 0, 0)
-        ss_button_row = QHBoxLayout()
-        ss_button_row.setContentsMargins(0, 0, 0, 0)
-        self._add_search_btn = QPushButton("  Add Search")
-        self._add_search_btn.setIcon(load_icon("plus"))
-        self._add_search_btn.setIconSize(QSize(14, 14))
-        self._add_search_btn.clicked.connect(self._on_add_search_clicked)
-        ss_button_row.addWidget(self._add_search_btn)
-        self._new_folder_btn = QPushButton("  New Folder")
-        self._new_folder_btn.setIcon(load_icon("folder"))
-        self._new_folder_btn.setIconSize(QSize(14, 14))
-        self._new_folder_btn.clicked.connect(self._on_new_folder_clicked)
-        ss_button_row.addWidget(self._new_folder_btn)
-        search_left_layout.addLayout(ss_button_row)
         self._saved_searches_tree = SavedSearchesTree()
         self._saved_searches_tree.setMinimumWidth(200)
         self._saved_searches_tree.item_moved.connect(self._refresh_saved_searches_tree)
@@ -659,7 +660,9 @@ class MessageViews(QWidget):
         self._export_rsmf_btn.clicked.connect(self.export_rsmf_requested.emit)
         export_row.addWidget(self._export_rsmf_btn)
         search_right_layout.addLayout(export_row)
-        self._search_placeholder = QLabel("Select a search from the list or click Add Search to create one.")
+        self._search_placeholder = QLabel(
+            "Right-click the Saved searches folder (or any folder) to create a new search or subfolder."
+        )
         self._search_placeholder.setProperty("class", "placeholder")
         self._search_placeholder.setWordWrap(True)
         search_right_layout.addWidget(self._search_placeholder)
@@ -845,30 +848,25 @@ class MessageViews(QWidget):
                     tree.setCurrentItem(found)
                     break
 
-    def get_selected_folder_id(self) -> Optional[str]:
-        """Return the folder id of the currently selected folder or the parent folder of the selected search."""
+    def get_selected_folder_id(self) -> str:
+        """Return the folder id of the currently selected folder, the parent folder of
+        the selected search, or the library root if nothing useful is selected."""
         item = self._saved_searches_tree.currentItem()
         if item is None:
-            return None
+            return LIBRARY_ROOT_FOLDER_ID
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(data, tuple):
-            return None
+            return LIBRARY_ROOT_FOLDER_ID
         kind, ident = data
         if kind == "folder":
-            return ident
+            return ident or LIBRARY_ROOT_FOLDER_ID
         parent = item.parent()
         if parent is None:
-            return None
+            return LIBRARY_ROOT_FOLDER_ID
         pdata = parent.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(pdata, tuple) and pdata[0] == "folder":
-            return pdata[1]
-        return None
-
-    def _on_add_search_clicked(self) -> None:
-        self.add_search_requested.emit(self.get_selected_folder_id())
-
-    def _on_new_folder_clicked(self) -> None:
-        self._create_folder(parent_id=self.get_selected_folder_id())
+            return pdata[1] or LIBRARY_ROOT_FOLDER_ID
+        return LIBRARY_ROOT_FOLDER_ID
 
     def _create_folder(self, parent_id: Optional[str]) -> None:
         if not self._app_data_root:
@@ -879,27 +877,36 @@ class MessageViews(QWidget):
         name = (name or "").strip()
         if not name:
             return
-        add_folder(self._app_data_root, name, parent_id=parent_id)
+        add_folder(self._app_data_root, name, parent_id=parent_id or LIBRARY_ROOT_FOLDER_ID)
         self._refresh_saved_searches_tree()
 
     def _on_tree_context_menu(self, pos) -> None:
         tree = self._saved_searches_tree
         item = tree.itemAt(pos)
-        menu = QMenu(tree)
         if item is None:
-            menu.addAction("New folder", lambda: self._create_folder(parent_id=None))
-            menu.exec(tree.viewport().mapToGlobal(pos))
             return
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(data, tuple):
             return
         kind, ident = data
+        menu = QMenu(tree)
         if kind == "folder":
-            menu.addAction("New subfolder", lambda: self._create_folder(parent_id=ident))
-            menu.addAction("Rename folder...", lambda: self._on_rename_folder(ident))
-            menu.addAction("Delete folder...", lambda: self._on_delete_folder(ident))
+            menu.addAction(
+                "New search",
+                lambda: self.add_search_requested.emit(ident),
+            )
+            menu.addAction(
+                "New subfolder",
+                lambda: self._create_folder(parent_id=ident),
+            )
+            if not is_library_root_folder_id(ident):
+                menu.addSeparator()
+                menu.addAction("Rename folder...", lambda: self._on_rename_folder(ident))
+                menu.addAction("Delete folder...", lambda: self._on_delete_folder(ident))
         elif kind == "search":
             menu.addAction("Move to folder...", lambda: self._on_move_search(ident))
+        if menu.isEmpty():
+            return
         menu.exec(tree.viewport().mapToGlobal(pos))
 
     def _on_rename_folder(self, folder_id: str) -> None:
@@ -960,11 +967,13 @@ class MessageViews(QWidget):
         if not self._app_data_root:
             return
         folders = load_folders(self._app_data_root)
-        labels = ["(No folder)"]
-        ids: List[Optional[str]] = [None]
+        labels: List[str] = []
+        ids: List[str] = []
         for folder, depth in walk_folders_depth_first(folders):
             labels.append(("    " * depth) + (folder.get("name") or "Unnamed folder"))
             ids.append(folder.get("id"))
+        if not labels:
+            return
         choice, ok = QInputDialog.getItem(
             self,
             "Move search",

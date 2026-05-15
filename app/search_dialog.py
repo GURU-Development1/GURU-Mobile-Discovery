@@ -26,7 +26,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QDate, Qt, QSize, pyqtSignal
 
-from app.saved_searches import add_saved_search, load_folders, walk_folders_depth_first
+from app.saved_searches import (
+    LIBRARY_ROOT_FOLDER_ID,
+    add_saved_search,
+    load_folders,
+    walk_folders_depth_first,
+)
 from app.style import icon as load_icon
 
 
@@ -70,14 +75,18 @@ class SearchDialog(QDialog):
         form.addRow("Search name:", self._name_edit)
 
         self._folder_combo = QComboBox()
-        self._folder_combo.addItem("(No folder)", None)
         folders = load_folders(self._app_data_root)
         select_index = 0
-        for i, (folder, depth) in enumerate(walk_folders_depth_first(folders), start=1):
+        target_id = default_folder_id or LIBRARY_ROOT_FOLDER_ID
+        for i, (folder, depth) in enumerate(walk_folders_depth_first(folders)):
             label = ("    " * depth) + (folder.get("name") or "Unnamed folder")
             self._folder_combo.addItem(label, folder.get("id"))
-            if default_folder_id and folder.get("id") == default_folder_id:
+            if folder.get("id") == target_id:
                 select_index = i
+        if self._folder_combo.count() == 0:
+            # Defensive fallback: library root should always exist after load_folders,
+            # but guarantee at least one selectable entry so the combo isn't empty.
+            self._folder_combo.addItem("Saved searches", LIBRARY_ROOT_FOLDER_ID)
         self._folder_combo.setCurrentIndex(select_index)
         form.addRow("Folder:", self._folder_combo)
 
@@ -220,7 +229,7 @@ class SearchDialog(QDialog):
             QMessageBox.warning(self, "Save search", "Enter a name for this search.")
             return
         criteria = self._get_criteria()
-        folder_id = self._folder_combo.currentData()
+        folder_id = self._folder_combo.currentData() or LIBRARY_ROOT_FOLDER_ID
         item = add_saved_search(
             self._app_data_root,
             name=name,

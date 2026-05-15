@@ -2,15 +2,16 @@
 Persist and load saved search definitions (name, criteria, chunk_24h) and folders.
 Stored under app data root as saved_searches.json.
 
-JSON schema (forward + backward compatible):
+JSON schema:
 {
   "searches": [ { id, sequence, name, to_filter, body_filter, date_from, date_to,
-                  has_attachments, hash_filter, chunk_24h, folder_id (optional) }, ... ],
-  "folders":  [ { id, name, parent_id (optional, null for root) }, ... ]
+                  has_attachments, hash_filter, chunk_24h, folder_id }, ... ],
+  "folders":  [ { id, name, parent_id (null only for the library root folder) }, ... ]
 }
 
 Each saved search has a sequence number (0001, 0002, ...) for Conversation ID prefixing.
-Folders are optional; saved searches with no/empty folder_id render at the root.
+Every install has exactly one persisted top-level "library root" folder; all other
+folders nest under it, and every saved search lives inside some folder.
 """
 
 from __future__ import annotations
@@ -19,6 +20,21 @@ import json
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+# Stable id for the always-present library root folder. The all-zero/one pattern
+# guarantees no collision with `uuid.uuid4()` (which sets version and variant bits).
+LIBRARY_ROOT_FOLDER_ID = "00000000-0001-0001-0001-000000000001"
+LIBRARY_ROOT_FOLDER_NAME = "Saved searches"
+
+
+def library_root_folder_id() -> str:
+    """Return the stable id used for the default top-level folder."""
+    return LIBRARY_ROOT_FOLDER_ID
+
+
+def is_library_root_folder_id(folder_id: Optional[str]) -> bool:
+    return folder_id == LIBRARY_ROOT_FOLDER_ID
 
 
 def _saved_searches_file(app_data_root: Path) -> Path:
@@ -48,8 +64,64 @@ def _write_raw(app_data_root: Path, searches: List[Dict[str, Any]], folders: Lis
     )
 
 
+def ensure_library_root(app_data_root: Path) -> None:
+    """Guarantee the library root folder exists and absorbs any orphan items.
+
+    Idempotent. Reads raw data once, applies migrations, and writes back only
+    when something changed. Reads/writes are done at the raw layer to avoid
+    recursion with the public load/save helpers.
+    """
+    data = _read_raw(app_data_root)
+    raw_folders = data.get("folders") if isinstance(data, dict) else None
+    raw_searches = data.get("searches") if isinstance(data, dict) else None
+    folders: List[Dict[str, Any]] = [dict(f) for f in raw_folders] if isinstance(raw_folders, list) else []
+    searches: List[Dict[str, Any]] = [dict(s) for s in raw_searches] if isinstance(raw_searches, list) else []
+
+    changed = False
+
+    has_root = any(
+        isinstance(f, dict) and f.get("id") == LIBRARY_ROOT_FOLDER_ID for f in folders
+    )
+    if not has_root:
+        folders.insert(
+            0,
+            {
+                "id": LIBRARY_ROOT_FOLDER_ID,
+                "name": LIBRARY_ROOT_FOLDER_NAME,
+                "parent_id": None,
+            },
+        )
+        changed = True
+
+    for f in folders:
+        if not isinstance(f, dict):
+            continue
+        fid = f.get("id")
+        if fid == LIBRARY_ROOT_FOLDER_ID:
+            if f.get("parent_id") is not None:
+                f["parent_id"] = None
+                changed = True
+            continue
+        parent = f.get("parent_id")
+        if not parent:
+            f["parent_id"] = LIBRARY_ROOT_FOLDER_ID
+            changed = True
+
+    for s in searches:
+        if not isinstance(s, dict):
+            continue
+        folder_id = s.get("folder_id")
+        if not folder_id:
+            s["folder_id"] = LIBRARY_ROOT_FOLDER_ID
+            changed = True
+
+    if changed:
+        _write_raw(app_data_root, searches, folders)
+
+
 def load_saved_searches(app_data_root: Path) -> List[Dict[str, Any]]:
     """Load list of saved searches. Each item: id, sequence, name, to_filter, body_filter, date_from, date_to, has_attachments, hash_filter, chunk_24h, folder_id. Legacy from_filter is ignored."""
+    ensure_library_root(app_data_root)
     data = _read_raw(app_data_root)
     items = data.get("searches", []) if isinstance(data, dict) else []
     folders = data.get("folders", []) if isinstance(data, dict) else []
@@ -121,7 +193,7 @@ def add_saved_search(
         "has_attachments": (has_attachments or "any").strip().lower() or "any",
         "hash_filter": (hash_filter or "").strip(),
         "chunk_24h": bool(chunk_24h),
-        "folder_id": (folder_id or None),
+        "folder_id": folder_id or LIBRARY_ROOT_FOLDER_ID,
     }
     searches.append(item)
     save_saved_searches(app_data_root, searches)
@@ -174,6 +246,7 @@ def delete_saved_search(app_data_root: Path, search_id: str) -> bool:
 
 def load_folders(app_data_root: Path) -> List[Dict[str, Any]]:
     """Load list of folders. Each item: id, name, parent_id (Optional[str])."""
+    ensure_library_root(app_data_root)
     data = _read_raw(app_data_root)
     items = data.get("folders", []) if isinstance(data, dict) else []
     folders: List[Dict[str, Any]] = []
@@ -200,12 +273,12 @@ def save_folders(app_data_root: Path, folders: List[Dict[str, Any]]) -> None:
 
 
 def add_folder(app_data_root: Path, name: str, parent_id: Optional[str] = None) -> Dict[str, Any]:
-    """Append a new folder and return it."""
+    """Append a new folder under the given parent (defaults to the library root)."""
     folders = load_folders(app_data_root)
     folder = {
         "id": str(uuid.uuid4()),
         "name": (name or "New folder").strip() or "New folder",
-        "parent_id": (parent_id or None),
+        "parent_id": parent_id or LIBRARY_ROOT_FOLDER_ID,
     }
     folders.append(folder)
     save_folders(app_data_root, folders)
@@ -224,15 +297,19 @@ def rename_folder(app_data_root: Path, folder_id: str, name: str) -> Optional[Di
 
 
 def move_folder(app_data_root: Path, folder_id: str, parent_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Move a folder to a new parent. Rejects self/descendant cycles. Returns updated folder or None."""
-    folders = load_folders(app_data_root)
-    if folder_id == (parent_id or None):
+    """Move a folder to a new parent. Rejects self/descendant cycles and any
+    attempt to reparent the library root. Returns updated folder or None."""
+    if folder_id == LIBRARY_ROOT_FOLDER_ID:
         return None
-    if parent_id and _is_descendant(folders, folder_id, parent_id):
+    target_parent = parent_id or LIBRARY_ROOT_FOLDER_ID
+    if folder_id == target_parent:
+        return None
+    folders = load_folders(app_data_root)
+    if _is_descendant(folders, folder_id, target_parent):
         return None
     for f in folders:
         if f.get("id") == folder_id:
-            f["parent_id"] = (parent_id or None)
+            f["parent_id"] = target_parent
             save_folders(app_data_root, folders)
             return f
     return None
@@ -291,8 +368,11 @@ def descendant_search_count(
 def delete_folder_cascade(app_data_root: Path, folder_id: str) -> Tuple[int, int]:
     """
     Delete a folder, all descendant folders, and every saved search inside the subtree.
-    Returns (folders_deleted, searches_deleted).
+    Returns (folders_deleted, searches_deleted). The library root folder cannot
+    be deleted.
     """
+    if folder_id == LIBRARY_ROOT_FOLDER_ID:
+        return (0, 0)
     folders = load_folders(app_data_root)
     searches = load_saved_searches(app_data_root)
     ids = set(descendant_folder_ids(folders, folder_id))
@@ -309,7 +389,8 @@ def delete_folder_cascade(app_data_root: Path, folder_id: str) -> Tuple[int, int
 def walk_folders_depth_first(folders: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], int]]:
     """
     Return [(folder, depth), ...] in a stable depth-first order rooted at top-level folders.
-    Depth is 0 for top-level folders. Folders with missing parents are treated as top-level.
+    The library root folder is emitted first at depth 0; remaining siblings sort by name.
+    Folders with missing parents are treated as top-level.
     """
     by_parent: Dict[Optional[str], List[Dict[str, Any]]] = {}
     folder_ids = {f.get("id") for f in folders}
@@ -318,8 +399,14 @@ def walk_folders_depth_first(folders: List[Dict[str, Any]]) -> List[Tuple[Dict[s
         if parent and parent not in folder_ids:
             parent = None
         by_parent.setdefault(parent, []).append(f)
+
+    def _sort_key(f: Dict[str, Any]) -> Tuple[int, str]:
+        # Library root always sorts first within its sibling group.
+        is_root = 0 if f.get("id") == LIBRARY_ROOT_FOLDER_ID else 1
+        return (is_root, (f.get("name") or "").lower())
+
     for k in by_parent:
-        by_parent[k].sort(key=lambda f: (f.get("name") or "").lower())
+        by_parent[k].sort(key=_sort_key)
 
     out: List[Tuple[Dict[str, Any], int]] = []
 
