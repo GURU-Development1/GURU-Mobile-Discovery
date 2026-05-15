@@ -84,6 +84,10 @@ class CaseTreeWidget(QTreeWidget):
     """Tree widget that clears selection when clicking empty space."""
     empty_area_clicked = pyqtSignal()
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CaseImportTree")
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             item = self.itemAt(event.position().toPoint())
@@ -752,7 +756,12 @@ class MainWindow(QMainWindow):
             populate_table=populate_table,
         )
         self._backup_cache_put((case_id, backup_id), to_cache)
-        self._message_views.set_app_data_root(self._app_data_root)
+        lib_name = (self._cases.get(case_id) or "").strip() or None
+        self._message_views.set_app_data_root(
+            self._app_data_root,
+            case_id=case_id,
+            library_display_name=lib_name,
+        )
         self._message_views.show_thread_view()
         self._stack.setCurrentWidget(self._message_panel)
         self._refresh_file_menu_backup_actions()
@@ -928,7 +937,17 @@ class MainWindow(QMainWindow):
         if not self._current_backup_id:
             QMessageBox.warning(self, "Search", "Load a backup first by selecting it in the tree.")
             return
-        dlg = SearchDialog(self._app_data_root, self, default_folder_id=default_folder_id)
+        if not self._current_case_id:
+            QMessageBox.warning(self, "Search", "No case context for saved searches. Select a backup in the tree.")
+            return
+        lib_name = (self._cases.get(self._current_case_id) or "").strip() or None
+        dlg = SearchDialog(
+            self._app_data_root,
+            self._current_case_id,
+            self,
+            default_folder_id=default_folder_id,
+            library_display_name=lib_name,
+        )
         dlg.run_search_requested.connect(self._run_search)
         dlg.exec()
         self._message_views.refresh_saved_searches_list()
@@ -1157,6 +1176,7 @@ class MainWindow(QMainWindow):
         if self._current_case_id == case_id:
             self._current_case_id = None
             self._current_backup_id = None
+            self._message_views.set_app_data_root(self._app_data_root)
             self._stack.setCurrentWidget(self._placeholder)
             self._refresh_file_menu_backup_actions()
 

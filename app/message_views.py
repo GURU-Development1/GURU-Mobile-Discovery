@@ -23,9 +23,11 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QProxyStyle,
     QPushButton,
     QSplitter,
     QStackedWidget,
+    QStyle,
     QStyleFactory,
     QTableWidget,
     QTableWidgetItem,
@@ -35,8 +37,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QRect
-from PyQt6.QtGui import QPainter, QPixmap, QWheelEvent
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QRect, QPoint
+from PyQt6.QtGui import QColor, QPainter, QPixmap, QPolygon, QWheelEvent
 
 from app.saved_searches import (
     LIBRARY_ROOT_FOLDER_ID,
@@ -487,6 +489,64 @@ class TableView(QWidget):
         self._rebuild()
 
 
+class SavedSearchesTreeProxyStyle(QProxyStyle):
+    """Fusion + global QSS often omit visible tree disclosure markers; draw chevrons here."""
+
+    _CHEVRON_GRAY = QColor("#6b7280")
+    _CHEVRON_WHITE = QColor("#ffffff")
+
+    def __init__(self, base_style: QStyle):
+        super().__init__(base_style)
+
+    def drawPrimitive(
+        self,
+        element: QStyle.PrimitiveElement,
+        option,
+        painter: QPainter,
+        widget=None,
+    ) -> None:
+        if element != QStyle.PrimitiveElement.PE_IndicatorBranch:
+            super().drawPrimitive(element, option, painter, widget)
+            return
+
+        # Rows with children: Fusion often paints nothing visible here; drawing after super()
+        # still leaves no marker. Paint only our disclosure icon (connector stubs are minor).
+        if option.state & QStyle.StateFlag.State_Children:
+            rect = option.rect
+            if rect.width() >= 4 and rect.height() >= 4:
+                expanded = bool(option.state & QStyle.StateFlag.State_Open)
+                selected = bool(option.state & QStyle.StateFlag.State_Selected)
+                color = self._CHEVRON_WHITE if selected else self._CHEVRON_GRAY
+
+                painter.save()
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setBrush(color)
+                painter.setPen(Qt.PenStyle.NoPen)
+
+                cx = rect.center().x()
+                cy = rect.center().y()
+                cell_h = min(rect.height(), 22)
+                half_w = max(4, min(8, cell_h // 3))
+
+                if expanded:
+                    points = [
+                        QPoint(cx - half_w, cy - 4),
+                        QPoint(cx + half_w, cy - 4),
+                        QPoint(cx, cy + max(4, half_w)),
+                    ]
+                else:
+                    points = [
+                        QPoint(cx - 4, cy - half_w),
+                        QPoint(cx + max(4, half_w), cy),
+                        QPoint(cx - 4, cy + half_w),
+                    ]
+                painter.drawPolygon(QPolygon(points))
+                painter.restore()
+            return
+
+        super().drawPrimitive(element, option, painter, widget)
+
+
 class SavedSearchesTree(QTreeWidget):
     """Tree of folders + saved searches. Supports internal drag-drop with persistence."""
 
@@ -494,6 +554,7 @@ class SavedSearchesTree(QTreeWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("SavedSearchesTree")
         self.setHeaderHidden(True)
         self.setUniformRowHeights(False)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -504,19 +565,20 @@ class SavedSearchesTree(QTreeWidget):
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._app_data_root: Optional[Path] = None
-        # Native Windows style paints branch decorations in a rect separate from QSS-styled
-        # ::item backgrounds (often leaves a white gutter beside rounded selections).
-        # Fusion honors show-decoration-selected + QSS more uniformly.
-        _fusion = QStyleFactory.create("Fusion")
-        if _fusion is not None:
-            _fusion.setParent(self)
-            self.setStyle(_fusion)
+        self._case_id: Optional[str] = None
+        # Fusion keeps whole-row selection aligned with QSS; proxy paints disclosure chevrons
+        # because Fusion ignores branch `image:` in stylesheets on Windows.
+        base = QStyleFactory.create("Fusion") or QApplication.style()
+        proxy = SavedSearchesTreeProxyStyle(base)
+        proxy.setParent(self)
+        self.setStyle(proxy)
 
-    def set_app_data_root(self, p: Optional[Path]) -> None:
+    def set_saved_search_storage(self, p: Optional[Path], case_id: Optional[str]) -> None:
         self._app_data_root = p
+        self._case_id = case_id
 
     def dropEvent(self, event) -> None:
-        if self._app_data_root is None:
+        if self._app_data_root is None or self._case_id is None:
             event.ignore()
             return
         source = self.currentItem()
@@ -561,11 +623,11 @@ class SavedSearchesTree(QTreeWidget):
                 target_folder_id = _parent_folder_id(target)
 
         if src_kind == "folder":
-            if move_folder(self._app_data_root, src_id, target_folder_id) is None:
+            if move_folder(self._app_data_root, self._case_id, src_id, target_folder_id) is None:
                 event.ignore()
                 return
         elif src_kind == "search":
-            if update_saved_search(self._app_data_root, src_id, folder_id=target_folder_id) is None:
+            if update_saved_search(self._app_data_root, self._case_id, src_id, folder_id=target_folder_id) is None:
                 event.ignore()
                 return
         else:
@@ -661,7 +723,8 @@ class MessageViews(QWidget):
         export_row.addWidget(self._export_rsmf_btn)
         search_right_layout.addLayout(export_row)
         self._search_placeholder = QLabel(
-            "Right-click the Saved searches folder (or any folder) to create a new search or subfolder."
+            "Right-click the top folder (named after this case by default) or any subfolder "
+            "to create a new search or subfolder."
         )
         self._search_placeholder.setProperty("class", "placeholder")
         self._search_placeholder.setWordWrap(True)
@@ -678,6 +741,8 @@ class MessageViews(QWidget):
         layout.addWidget(self._tabs)
         self._tabs.currentChanged.connect(self._on_search_tab_activated)
         self._app_data_root: Optional[Path] = None
+        self._case_id: Optional[str] = None
+        self._library_display_name: Optional[str] = None
         self._chats: List[dict] = []
         self._filtered_chats: List[dict] = []
         self._chat_id_to_messages: Dict[int, List[dict]] = {}
@@ -705,9 +770,18 @@ class MessageViews(QWidget):
     def _hide_lightbox(self) -> None:
         self._view_stack.setCurrentWidget(self._stack)
 
-    def set_app_data_root(self, path: Optional[Path]) -> None:
+    def set_app_data_root(
+        self,
+        path: Optional[Path],
+        case_id: Optional[str] = None,
+        library_display_name: Optional[str] = None,
+    ) -> None:
         self._app_data_root = path
-        self._saved_searches_tree.set_app_data_root(path)
+        self._case_id = case_id
+        disp = (library_display_name or "").strip()
+        self._library_display_name = disp or None
+        self._saved_searches_tree.set_saved_search_storage(path, case_id)
+        self._refresh_saved_searches_tree()
 
     def _on_search_tab_activated(self, index: int) -> None:
         if index == 2:
@@ -764,11 +838,19 @@ class MessageViews(QWidget):
             selected_data = current.data(0, Qt.ItemDataRole.UserRole)
 
         tree.clear()
-        if not self._app_data_root:
+        if not self._app_data_root or not self._case_id:
             return
 
-        folders = load_folders(self._app_data_root)
-        searches = load_saved_searches(self._app_data_root)
+        folders = load_folders(
+            self._app_data_root,
+            self._case_id,
+            library_display_name=self._library_display_name,
+        )
+        searches = load_saved_searches(
+            self._app_data_root,
+            self._case_id,
+            library_display_name=self._library_display_name,
+        )
 
         folder_items: Dict[str, QTreeWidgetItem] = {}
         for folder, depth in walk_folders_depth_first(folders):
@@ -869,7 +951,7 @@ class MessageViews(QWidget):
         return LIBRARY_ROOT_FOLDER_ID
 
     def _create_folder(self, parent_id: Optional[str]) -> None:
-        if not self._app_data_root:
+        if not self._app_data_root or not self._case_id:
             return
         name, ok = QInputDialog.getText(self, "New folder", "Folder name:")
         if not ok:
@@ -877,7 +959,7 @@ class MessageViews(QWidget):
         name = (name or "").strip()
         if not name:
             return
-        add_folder(self._app_data_root, name, parent_id=parent_id or LIBRARY_ROOT_FOLDER_ID)
+        add_folder(self._app_data_root, self._case_id, name, parent_id=parent_id or LIBRARY_ROOT_FOLDER_ID)
         self._refresh_saved_searches_tree()
 
     def _on_tree_context_menu(self, pos) -> None:
@@ -895,11 +977,12 @@ class MessageViews(QWidget):
                 "New search",
                 lambda: self.add_search_requested.emit(ident),
             )
-            menu.addAction(
-                "New subfolder",
-                lambda: self._create_folder(parent_id=ident),
-            )
+            # Library root: searches only — no subfolders; cannot rename or delete (see saved_searches).
             if not is_library_root_folder_id(ident):
+                menu.addAction(
+                    "New subfolder",
+                    lambda: self._create_folder(parent_id=ident),
+                )
                 menu.addSeparator()
                 menu.addAction("Rename folder...", lambda: self._on_rename_folder(ident))
                 menu.addAction("Delete folder...", lambda: self._on_delete_folder(ident))
@@ -910,9 +993,11 @@ class MessageViews(QWidget):
         menu.exec(tree.viewport().mapToGlobal(pos))
 
     def _on_rename_folder(self, folder_id: str) -> None:
-        if not self._app_data_root:
+        if is_library_root_folder_id(folder_id):
             return
-        folders = load_folders(self._app_data_root)
+        if not self._app_data_root or not self._case_id:
+            return
+        folders = load_folders(self._app_data_root, self._case_id)
         current = next((f for f in folders if f.get("id") == folder_id), None)
         if current is None:
             return
@@ -927,14 +1012,16 @@ class MessageViews(QWidget):
         name = (name or "").strip()
         if not name:
             return
-        rename_folder(self._app_data_root, folder_id, name)
+        rename_folder(self._app_data_root, self._case_id, folder_id, name)
         self._refresh_saved_searches_tree()
 
     def _on_delete_folder(self, folder_id: str) -> None:
-        if not self._app_data_root:
+        if is_library_root_folder_id(folder_id):
             return
-        folders = load_folders(self._app_data_root)
-        searches = load_saved_searches(self._app_data_root)
+        if not self._app_data_root or not self._case_id:
+            return
+        folders = load_folders(self._app_data_root, self._case_id)
+        searches = load_saved_searches(self._app_data_root, self._case_id)
         target = next((f for f in folders if f.get("id") == folder_id), None)
         if target is None:
             return
@@ -956,17 +1043,17 @@ class MessageViews(QWidget):
         ) == QMessageBox.StandardButton.Yes
         if not ok:
             return
-        _, deleted_searches = delete_folder_cascade(self._app_data_root, folder_id)
+        _, deleted_searches = delete_folder_cascade(self._app_data_root, self._case_id, folder_id)
         if deleted_searches and self._current_search_id is not None:
-            remaining = {s.get("id") for s in load_saved_searches(self._app_data_root)}
+            remaining = {s.get("id") for s in load_saved_searches(self._app_data_root, self._case_id)}
             if self._current_search_id not in remaining:
                 self.clear_search_results()
         self._refresh_saved_searches_tree()
 
     def _on_move_search(self, search_id: str) -> None:
-        if not self._app_data_root:
+        if not self._app_data_root or not self._case_id:
             return
-        folders = load_folders(self._app_data_root)
+        folders = load_folders(self._app_data_root, self._case_id)
         labels: List[str] = []
         ids: List[str] = []
         for folder, depth in walk_folders_depth_first(folders):
@@ -988,12 +1075,12 @@ class MessageViews(QWidget):
             target_id = ids[labels.index(choice)]
         except ValueError:
             return
-        update_saved_search(self._app_data_root, search_id, folder_id=target_id)
+        update_saved_search(self._app_data_root, self._case_id, search_id, folder_id=target_id)
         self._refresh_saved_searches_tree()
 
     def _on_delete_search(self, search_id: Optional[str]) -> None:
         """Delete a saved search and clear its results if currently displayed."""
-        if not search_id or not self._app_data_root:
+        if not search_id or not self._app_data_root or not self._case_id:
             return
         ok = QMessageBox.question(
             self,
@@ -1004,7 +1091,7 @@ class MessageViews(QWidget):
         ) == QMessageBox.StandardButton.Yes
         if not ok:
             return
-        if delete_saved_search(self._app_data_root, search_id):
+        if delete_saved_search(self._app_data_root, self._case_id, search_id):
             if self._current_search_id == search_id:
                 self.clear_search_results()
             self._refresh_saved_searches_tree()

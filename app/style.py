@@ -240,10 +240,13 @@ QComboBox QAbstractItemView {
 }
 
 /* =========================================================
-   Tree widget
+   Tree widgets
    ========================================================= */
-/* Whole-row selection needs square corners on ::item; rounded rects plus native branch painting leave a visible white gutter between the branch column and the label on Windows. */
-QTreeWidget {
+/* Saved searches: scoped QSS so Qt still calls PE_IndicatorBranch (proxy paints chevrons).
+   A global QTreeWidget stylesheet makes Qt paint branches via the style sheet engine and
+   skips primitive painting — invisible disclosure icons. */
+/* Whole-row selection needs square corners on ::item; Fusion + proxy on SavedSearchesTree. */
+#SavedSearchesTree {
     background-color: #ffffff;
     border: 1px solid #e1e6ed;
     border-radius: 8px;
@@ -254,7 +257,7 @@ QTreeWidget {
     selection-color: #ffffff;
 }
 
-QTreeWidget::item {
+#SavedSearchesTree::item {
     padding: 7px 10px;
     border-radius: 0;
     margin: 0;
@@ -262,41 +265,64 @@ QTreeWidget::item {
     color: #1f2937;
 }
 
-QTreeWidget::item:hover {
+#SavedSearchesTree::item:hover {
     background-color: #eaf0f8;
 }
 
-QTreeWidget::item:selected:hover {
+#SavedSearchesTree::item:selected:hover {
     background-color: #4a73b8;
     color: white;
 }
 
-QTreeWidget::item:selected {
+#SavedSearchesTree::item:selected {
     background-color: #4a73b8;
     color: white;
 }
 
-QTreeWidget::item:selected:!active {
+#SavedSearchesTree::item:selected:!active {
     background-color: #4a73b8;
     color: white;
 }
 
-QTreeWidget::branch {
-    background-color: transparent;
-    border-image: none;
-    image: none;
+/* Do not style #SavedSearchesTree::branch — QSS on ::branch forces Qt's stylesheet branch path and PE_IndicatorBranch is never drawn (no proxy chevrons). */
+
+/* Case / backup tree (no disclosure column — RootIsDecorated off, indentation 0) */
+QTreeWidget#CaseImportTree {
+    background-color: #ffffff;
+    border: 1px solid #e1e6ed;
+    border-radius: 8px;
+    padding: 6px;
+    outline: none;
+    show-decoration-selected: 1;
+    selection-background-color: #4a73b8;
+    selection-color: #ffffff;
 }
 
-QTreeWidget::branch:hover {
+QTreeWidget#CaseImportTree::item {
+    padding: 7px 10px;
+    border-radius: 5px;
+    margin: 1px 0;
+    border: none;
+    color: #1f2937;
+}
+
+QTreeWidget#CaseImportTree::item:hover {
     background-color: #eaf0f8;
 }
 
-QTreeWidget::branch:selected {
+QTreeWidget#CaseImportTree::item:selected:hover {
     background-color: #4a73b8;
+    color: white;
 }
 
-QTreeWidget::branch:selected:hover {
+QTreeWidget#CaseImportTree::item:selected {
     background-color: #4a73b8;
+    color: white;
+}
+
+QTreeWidget#CaseImportTree::item:selected:!active {
+    background-color: #4a73b8;
+    color: white;
 }
 
 QHeaderView::section {

@@ -28,6 +28,7 @@ from PyQt6.QtCore import QDate, Qt, QSize, pyqtSignal
 
 from app.saved_searches import (
     LIBRARY_ROOT_FOLDER_ID,
+    LIBRARY_ROOT_FOLDER_NAME,
     add_saved_search,
     load_folders,
     walk_folders_depth_first,
@@ -60,9 +61,17 @@ class SearchDialog(QDialog):
 
     run_search_requested = pyqtSignal(dict)  # criteria dict
 
-    def __init__(self, app_data_root: Path, parent=None, default_folder_id: Optional[str] = None):
+    def __init__(
+        self,
+        app_data_root: Path,
+        case_id: str,
+        parent=None,
+        default_folder_id: Optional[str] = None,
+        library_display_name: Optional[str] = None,
+    ):
         super().__init__(parent)
         self._app_data_root = Path(app_data_root)
+        self._case_id = case_id
         self.setWindowTitle("Search messages")
         self.setMinimumWidth(480)
         self.setWindowFlag(Qt.WindowType.MSWindowsFixedSizeDialogHint, True)
@@ -75,7 +84,11 @@ class SearchDialog(QDialog):
         form.addRow("Search name:", self._name_edit)
 
         self._folder_combo = QComboBox()
-        folders = load_folders(self._app_data_root)
+        folders = load_folders(
+            self._app_data_root,
+            self._case_id,
+            library_display_name=library_display_name,
+        )
         select_index = 0
         target_id = default_folder_id or LIBRARY_ROOT_FOLDER_ID
         for i, (folder, depth) in enumerate(walk_folders_depth_first(folders)):
@@ -86,7 +99,8 @@ class SearchDialog(QDialog):
         if self._folder_combo.count() == 0:
             # Defensive fallback: library root should always exist after load_folders,
             # but guarantee at least one selectable entry so the combo isn't empty.
-            self._folder_combo.addItem("Saved searches", LIBRARY_ROOT_FOLDER_ID)
+            root_label = (library_display_name or "").strip() or LIBRARY_ROOT_FOLDER_NAME
+            self._folder_combo.addItem(root_label, LIBRARY_ROOT_FOLDER_ID)
         self._folder_combo.setCurrentIndex(select_index)
         form.addRow("Folder:", self._folder_combo)
 
@@ -232,6 +246,7 @@ class SearchDialog(QDialog):
         folder_id = self._folder_combo.currentData() or LIBRARY_ROOT_FOLDER_ID
         item = add_saved_search(
             self._app_data_root,
+            self._case_id,
             name=name,
             to_filter=criteria["to_filter"],
             body_filter=criteria["body_filter"],
