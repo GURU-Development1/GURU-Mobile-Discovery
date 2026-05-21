@@ -6,7 +6,7 @@ A legacy global ``<app_data>/saved_searches.json`` is copied into a case file on
 JSON schema:
 {
   "searches": [ { id, sequence, name, to_filter, body_filter, date_from, date_to,
-                  has_attachments, hash_filter, chunk_24h, folder_id }, ... ],
+                  has_attachments, hash_filter, chunk_24h, thread_ids, folder_id }, ... ],
   "folders":  [ { id, name, parent_id (null only for the library root folder) }, ... ]
 }
 
@@ -214,6 +214,7 @@ def add_saved_search(
     has_attachments: str = "any",
     hash_filter: str = "",
     chunk_24h: bool = False,
+    thread_ids: Optional[List[int]] = None,
     folder_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Append a new saved search and return it (with id and sequence set)."""
@@ -231,6 +232,7 @@ def add_saved_search(
         "has_attachments": (has_attachments or "any").strip().lower() or "any",
         "hash_filter": (hash_filter or "").strip(),
         "chunk_24h": bool(chunk_24h),
+        "thread_ids": [int(t) for t in (thread_ids or []) if t is not None],
         "folder_id": folder_id or LIBRARY_ROOT_FOLDER_ID,
     }
     searches.append(item)
@@ -257,6 +259,7 @@ def update_saved_search(
                 "has_attachments",
                 "hash_filter",
                 "chunk_24h",
+                "thread_ids",
                 "sequence",
                 "folder_id",
             }

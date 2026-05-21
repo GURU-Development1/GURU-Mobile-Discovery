@@ -1,12 +1,12 @@
 """
-Export RSMF dialog: export location, custodian, RSMF version, and optional field toggles.
+Export RSMF dialog: export location, RSMF version, and optional field toggles.
 Exports search results to Relativity Short Message Format (.rsmf) files.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PyQt6.QtWidgets import (
     QDialog,
@@ -49,6 +49,7 @@ class ExportWorker(QThread):
         zip_name: Optional[str] = None,
         backup_path: Optional[str] = None,
         passphrase: Optional[str] = None,
+        chat_id_to_label: Optional[Dict[int, str]] = None,
     ):
         super().__init__()
         self._messages = messages
@@ -61,6 +62,7 @@ class ExportWorker(QThread):
         self._zip_name = zip_name
         self._backup_path = backup_path
         self._passphrase = passphrase
+        self._chat_id_to_label = chat_id_to_label or {}
 
     def run(self) -> None:
         log = get_logger()
@@ -117,6 +119,7 @@ class ExportWorker(QThread):
                 progress_cb=on_progress,
                 zip_name=self._zip_name,
                 attachment_resolver=resolver,
+                chat_id_to_label=self._chat_id_to_label,
             )
             self.export_finished.emit(paths)
         except Exception as e:
@@ -147,6 +150,8 @@ class ExportRsmfDialog(QDialog):
         parent=None,
         backup_path: Optional[str] = None,
         passphrase: Optional[str] = None,
+        chat_id_to_label: Optional[Dict[int, str]] = None,
+        zip_name: Optional[str] = None,
     ):
         super().__init__(parent)
         self._messages = messages
@@ -154,6 +159,8 @@ class ExportRsmfDialog(QDialog):
         self._custodian = custodian
         self._backup_path = backup_path
         self._passphrase = passphrase
+        self._chat_id_to_label = chat_id_to_label or {}
+        self._zip_name = zip_name
         self.setWindowTitle("Export RSMF")
         self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
@@ -172,12 +179,7 @@ class ExportRsmfDialog(QDialog):
         layout.addWidget(QLabel("Export location:"))
         layout.addLayout(loc_row)
 
-        # Custodian override and RSMF version
         form = QFormLayout()
-        self._custodian_edit = QLineEdit()
-        self._custodian_edit.setPlaceholderText("Backup custodian (e.g. device owner)")
-        self._custodian_edit.setText(custodian)
-        form.addRow("Custodian:", self._custodian_edit)
         self._version_combo = QComboBox()
         self._version_combo.addItem("RSMF 1", "1.0.0")
         self._version_combo.addItem("RSMF 2", "2.0.0")
@@ -232,18 +234,19 @@ class ExportRsmfDialog(QDialog):
             )
             return
 
-        custodian = self._custodian_edit.text().strip() or self._custodian
         rsmf_version = self._version_combo.currentData() or "1.0.0"
         self._worker = ExportWorker(
             self._messages,
             self._attachment_base,
             output_dir,
-            custodian,
+            self._custodian,
             rsmf_version=rsmf_version,
             include_is_deleted=self._include_is_deleted_cb.isChecked(),
             include_attachments=self._include_attachments_cb.isChecked(),
             backup_path=self._backup_path,
             passphrase=self._passphrase,
+            chat_id_to_label=self._chat_id_to_label,
+            zip_name=self._zip_name,
         )
         self._progress = QProgressDialog("Exporting RSMF files...", "Cancel", 0, 100, self)
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)

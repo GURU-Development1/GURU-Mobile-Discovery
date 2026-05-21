@@ -1,8 +1,8 @@
 /**
  * License-delivery email via Resend.
  *
- * The buyer receives the license key after a successful Stripe checkout. Plain
- * text and HTML variants are sent so the message renders cleanly in clients
+ * The buyer receives the license key after a successful Lemon Squeezy purchase.
+ * Plain text and HTML variants are sent so the message renders cleanly in clients
  * that block remote content.
  */
 

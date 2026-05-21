@@ -13,6 +13,9 @@ export interface KeygenLicense {
   expiry: string | null;
 }
 
+/** Metadata key stored on each license for Lemon Squeezy subscription lookup. */
+export const LS_SUBSCRIPTION_METADATA_KEY = "lemonsqueezySubscriptionId";
+
 function keygenUrl(env: Env, path: string): string {
   return `https://api.keygen.sh/v1/accounts/${env.KEYGEN_ACCOUNT_ID}${path}`;
 }
@@ -34,26 +37,29 @@ async function readJson<T = unknown>(response: Response): Promise<T> {
 }
 
 interface KeygenLicenseResource {
-  data?: {
-    id?: string;
-    attributes?: {
-      key?: string;
-      expiry?: string | null;
-    };
+  id?: string;
+  attributes?: {
+    key?: string;
+    expiry?: string | null;
+    metadata?: Record<string, string>;
   };
+}
+
+interface KeygenLicenseListResponse {
+  data?: KeygenLicenseResource[];
 }
 
 export async function createLicense(
   env: Env,
-  opts: { email: string; stripeCustomerId: string },
+  opts: { email: string; lemonsqueezySubscriptionId: string },
 ): Promise<KeygenLicense> {
   const body = {
     data: {
       type: "licenses",
       attributes: {
-        name: `Stripe ${opts.stripeCustomerId}`,
+        name: `LemonSqueezy sub ${opts.lemonsqueezySubscriptionId}`,
         metadata: {
-          stripe_customer_id: opts.stripeCustomerId,
+          [LS_SUBSCRIPTION_METADATA_KEY]: opts.lemonsqueezySubscriptionId,
           email: opts.email,
         },
       },
@@ -68,7 +74,7 @@ export async function createLicense(
     headers: authHeaders(env),
     body: JSON.stringify(body),
   });
-  const payload = await readJson<KeygenLicenseResource>(response);
+  const payload = await readJson<{ data?: KeygenLicenseResource }>(response);
   const data = payload.data || {};
   if (!data.id || !data.attributes?.key) {
     throw new Error("Keygen createLicense: missing id/key in response");
@@ -77,6 +83,30 @@ export async function createLicense(
     id: data.id,
     key: data.attributes.key,
     expiry: data.attributes.expiry ?? null,
+  };
+}
+
+export async function findLicenseBySubscriptionId(
+  env: Env,
+  subscriptionId: string,
+): Promise<KeygenLicense | null> {
+  const params = new URLSearchParams({
+    [`metadata[${LS_SUBSCRIPTION_METADATA_KEY}]`]: subscriptionId,
+    "page[size]": "1",
+  });
+  const response = await fetch(
+    keygenUrl(env, `/licenses?${params.toString()}`),
+    { headers: authHeaders(env) },
+  );
+  const payload = await readJson<KeygenLicenseListResponse>(response);
+  const row = payload.data?.[0];
+  if (!row?.id || !row.attributes?.key) {
+    return null;
+  }
+  return {
+    id: row.id,
+    key: row.attributes.key,
+    expiry: row.attributes.expiry ?? null,
   };
 }
 
@@ -105,9 +135,8 @@ export async function reinstateLicense(env: Env, licenseId: string): Promise<voi
 }
 
 /**
- * Renew a license by its policy's duration. Used on `invoice.payment_succeeded`
- * for subscription renewals (not the initial purchase, which already gets a
- * fresh expiry from license creation).
+ * Renew a license by its policy's duration. Used on subscription renewals (not
+ * the initial purchase, which already gets a fresh expiry from license creation).
  */
 export async function renewLicense(env: Env, licenseId: string): Promise<void> {
   const response = await fetch(

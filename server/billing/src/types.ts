@@ -1,6 +1,7 @@
 export interface Env {
-  STRIPE_SECRET_KEY: string;
-  STRIPE_WEBHOOK_SECRET: string;
+  LEMON_SQUEEZY_WEBHOOK_SECRET: string;
+  LEMON_SQUEEZY_STORE_ID?: string;
+  LEMON_SQUEEZY_API_KEY?: string;
   KEYGEN_ACCOUNT_ID: string;
   KEYGEN_PRODUCT_ID: string;
   KEYGEN_POLICY_ID: string;

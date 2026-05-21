@@ -8,7 +8,7 @@ from __future__ import annotations
 import zoneinfo
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -29,6 +29,9 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QStyleFactory,
+    QStyleOptionHeader,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -37,8 +40,18 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QRect, QPoint
-from PyQt6.QtGui import QColor, QPainter, QPixmap, QPolygon, QWheelEvent
+from PyQt6.QtCore import Qt, QSize, pyqtSignal, QRect, QPoint
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPixmap,
+    QPolygon,
+    QWheelEvent,
+    QBrush,
+    QPalette,
+)
 
 from app.saved_searches import (
     LIBRARY_ROOT_FOLDER_ID,
@@ -54,9 +67,49 @@ from app.saved_searches import (
     update_saved_search,
     walk_folders_depth_first,
 )
-from app.style import icon as load_icon
+from app.style import icon as load_icon, logo_path as resolve_logo_path
 from app.thread_list import VirtualThreadView as ThreadView
 from app.timezone_utils import get_tz_abbrev_for_timestamp
+
+
+def _lock_horizontal_splitter(splitter: QSplitter) -> None:
+    """Keep the left pane width fixed; disable drag-to-resize on the splitter handle."""
+    splitter.setHandleWidth(0)
+    splitter.setChildrenCollapsible(False)
+    splitter.setStretchFactor(0, 0)
+    splitter.setStretchFactor(1, 1)
+    if splitter.count() >= 2:
+        splitter.handle(0).setEnabled(False)
+
+
+# Default width for fixed left panes (threads chat list, saved-searches tree).
+_LEFT_SIDEBAR_WIDTH = 320
+# Shared toolbar band height so left/right split panes align on every tab.
+_TOOLBAR_ROW_HEIGHT = 36
+
+
+def _make_side_toolbar_row(
+    *,
+    leading: Optional[QWidget] = None,
+    trailing: Optional[QWidget] = None,
+) -> QWidget:
+    """Fixed-height row above main content; keeps left sidebar level with right pane."""
+    row = QWidget()
+    row.setFixedHeight(_TOOLBAR_ROW_HEIGHT)
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
+    if leading is not None:
+        lay.addWidget(leading, 1)
+    else:
+        lay.addStretch(1)
+    if trailing is not None:
+        lay.addWidget(trailing, 0, Qt.AlignmentFlag.AlignRight)
+    return row
+
+
+_SEARCH_SELECTED_BG = "#d6e4f5"
+_SEARCH_SELECTED_TEXT = "#1f2937"
 
 
 class TableWidgetWithShiftWheel(QTableWidget):
@@ -211,55 +264,192 @@ def _message_unix_timestamp(m: dict) -> Optional[float]:
 class FilterHeaderView(QHeaderView):
     """Header with sort (left) and filter (right) click zones; right edge reserved for resize."""
 
-    RESIZE_GRIP = 6
+    RESIZE_HIT = 12  # pixels around the column boundary used for resize cursor/drag
+    FILTER_ZONE = 26
+    TEXT_PAD_LEFT = 11
+    TEXT_PAD_RIGHT = 6
+    SORT_INDICATOR_WIDTH = 16
+    CLICK_SLOP = 8
+
     filter_clicked = pyqtSignal(int)
     sort_clicked = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
-        self._filter_zone = 24
         self._active_columns: set = set()
-        self.setSectionsClickable(True)
+        self.setSectionsClickable(False)
         self.setHighlightSections(True)
         self.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._pending_click: Optional[tuple[int, str]] = None
+        self._press_origin: Optional[QPoint] = None
+        self._resize_active = False
+
+    @property
+    def _filter_zone(self) -> int:
+        return self.FILTER_ZONE
+
+    @property
+    def RESIZE_GRIP(self) -> int:
+        return self.RESIZE_HIT
+
+    def reserved_trailing_width(self) -> int:
+        return self.RESIZE_HIT + self.FILTER_ZONE
+
+    def _header_label(self, logical_index: int) -> str:
+        model = self.model()
+        if model is None:
+            return ""
+        value = model.headerData(logical_index, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole)
+        return str(value) if value is not None else ""
+
+    def _label_font_metrics(self) -> QFontMetrics:
+        font = QFont(self.font())
+        font.setWeight(QFont.Weight.DemiBold)
+        return QFontMetrics(font)
+
+    def minimumSectionWidth(self, logical_index: int) -> int:
+        label = self._header_label(logical_index)
+        text_w = self._label_font_metrics().horizontalAdvance(label)
+        return (
+            self.TEXT_PAD_LEFT
+            + text_w
+            + self.SORT_INDICATOR_WIDTH
+            + self.TEXT_PAD_RIGHT
+            + self.reserved_trailing_width()
+        )
+
+    def _resize_handle_index(self, pos_x: int) -> int:
+        """Section whose right edge is near pos_x, or -1."""
+        half = self.RESIZE_HIT // 2
+        for i in range(self.count()):
+            if self.isSectionHidden(i):
+                continue
+            edge = self.sectionPosition(i) + self.sectionSize(i)
+            if abs(pos_x - edge) <= half:
+                return i
+        return -1
+
+    def _zone_at(self, pos_x: int) -> tuple[int, str]:
+        handle = self._resize_handle_index(pos_x)
+        if handle >= 0:
+            return (handle, "resize")
+        idx = self.logicalIndexAt(pos_x)
+        if idx < 0:
+            return (-1, "")
+        x0 = self.sectionPosition(idx)
+        rel = pos_x - x0
+        sz = self.sectionSize(idx)
+        trailing = self.reserved_trailing_width()
+        if rel >= sz - trailing:
+            return (idx, "filter")
+        return (idx, "sort")
 
     def set_active_columns(self, cols: set) -> None:
         self._active_columns = set(cols)
         self.viewport().update()
 
+    def leaveEvent(self, event) -> None:
+        if not self._resize_active:
+            self.unsetCursor()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._resize_active:
+            super().mouseMoveEvent(event)
+            return
+        pos = int(event.position().x())
+        if self._resize_handle_index(pos) >= 0:
+            self.setCursor(Qt.CursorShape.SplitHCursor)
+        else:
+            self.unsetCursor()
+        if self._pending_click and self._press_origin is not None:
+            moved = (event.position().toPoint() - self._press_origin).manhattanLength()
+            if moved > self.CLICK_SLOP:
+                self._pending_click = None
+
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
         pos = int(event.position().x())
-        idx = self.logicalIndexAt(pos)
-        if idx < 0:
-            return super().mousePressEvent(event)
-        x0 = self.sectionPosition(idx)
-        rel = pos - x0
-        sz = self.sectionSize(idx)
-        grip = self.RESIZE_GRIP
-        if rel >= sz - grip:
-            return super().mousePressEvent(event)
-        if rel >= sz - grip - self._filter_zone:
-            self.filter_clicked.emit(idx)
-            event.accept()
+        handle = self._resize_handle_index(pos)
+        if handle >= 0:
+            self._pending_click = None
+            self._press_origin = None
+            self._resize_active = True
+            super().mousePressEvent(event)
             return
-        self.sort_clicked.emit(idx)
+        idx, zone = self._zone_at(pos)
+        if idx < 0 or zone not in ("filter", "sort"):
+            return super().mousePressEvent(event)
+        self._pending_click = (idx, zone)
+        self._press_origin = event.position().toPoint()
         event.accept()
 
+    def mouseReleaseEvent(self, event) -> None:
+        if self._resize_active:
+            self._resize_active = False
+            self._pending_click = None
+            self._press_origin = None
+            super().mouseReleaseEvent(event)
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._pending_click is not None:
+            pos = int(event.position().x())
+            idx, zone = self._zone_at(pos)
+            pending_idx, pending_zone = self._pending_click
+            if (
+                idx == pending_idx
+                and zone == pending_zone
+                and self._press_origin is not None
+                and (event.position().toPoint() - self._press_origin).manhattanLength() <= self.CLICK_SLOP
+            ):
+                if zone == "filter":
+                    self.filter_clicked.emit(idx)
+                elif zone == "sort":
+                    self.sort_clicked.emit(idx)
+            self._pending_click = None
+            self._press_origin = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
     def paintSection(self, painter: QPainter, rect: QRect, logicalIndex: int) -> None:
-        super().paintSection(painter, rect, logicalIndex)
-        grip = self.RESIZE_GRIP
-        fr_w = max(12, self._filter_zone - 4)
-        fr_left = rect.right() - grip - self._filter_zone + 2
+        reserved = self.reserved_trailing_width()
+        content_rect = rect.adjusted(0, 0, -reserved, 0)
+
+        opt = QStyleOptionHeader()
+        self.initStyleOption(opt)
+        opt.rect = content_rect
+        opt.section = logicalIndex
+        opt.text = self._header_label(logicalIndex)
+        opt.textAlignment = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        opt.sortIndicator = QStyleOptionHeader.SortIndicator.SortNone
+        self.style().drawControl(QStyle.ControlElement.CE_Header, opt, painter, self)
+
+        grip = self.RESIZE_HIT
+        fr_w = max(12, self.FILTER_ZONE - 4)
+        fr_left = rect.right() - grip - self.FILTER_ZONE + 2
         fr = QRect(fr_left, rect.top() + 2, fr_w, rect.height() - 4)
+
+        indicator = ""
+        use_highlight = logicalIndex in self._active_columns
+        if self.isSortIndicatorShown() and self.sortIndicatorSection() == logicalIndex:
+            if self.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder:
+                indicator = "\u2191"
+            else:
+                indicator = "\u2193"
+        elif use_highlight:
+            indicator = "\u23f7"
+
+        if not indicator:
+            return
+
         painter.save()
         pal = self.palette()
-        c = pal.color(pal.ColorGroup.Active, pal.ColorRole.Highlight) if logicalIndex in self._active_columns else pal.color(
+        c = pal.color(pal.ColorGroup.Active, pal.ColorRole.Highlight) if use_highlight else pal.color(
             pal.ColorGroup.Active, pal.ColorRole.Mid
         )
         painter.setPen(c)
-        painter.drawText(fr, Qt.AlignmentFlag.AlignCenter, "⏷")
+        painter.drawText(fr, Qt.AlignmentFlag.AlignCenter, indicator)
         painter.restore()
 
 
@@ -307,6 +497,8 @@ class TableView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         self._table = TableWidgetWithShiftWheel()
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -315,6 +507,9 @@ class TableView(QWidget):
         self._table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._table.setShowGrid(True)
         self._table.setSortingEnabled(False)
+        vheader = self._table.verticalHeader()
+        vheader.setDefaultSectionSize(30)
+        vheader.setMinimumSectionSize(26)
 
         hdr = FilterHeaderView(self._table)
         self._table.setHorizontalHeader(hdr)
@@ -338,11 +533,20 @@ class TableView(QWidget):
         self._sort_cycle = 0  # 0=default, 1=asc, 2=desc
 
     def _apply_default_column_widths(self) -> None:
-        hdr = self._table.horizontalHeader()
-        widths = [180, 140, 200, 170, 80, 120, 70, 80, 420, 160]
-        for i, w in enumerate(widths):
-            if i < self._table.columnCount():
-                hdr.resizeSection(i, w)
+        hdr = self._filter_header
+        # Minimum data widths for columns whose cell content is typically wider than the header.
+        content_mins = [180, 140, 200, 170, 120, 140, 0, 0, 320, 160]
+        body_col = 8
+        for i in range(self._table.columnCount()):
+            header_min = hdr.minimumSectionWidth(i)
+            hdr.setMinimumSectionSize(header_min)
+            content_min = content_mins[i] if i < len(content_mins) else 0
+            if i == body_col:
+                hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+                hdr.resizeSection(i, max(header_min, content_min))
+            else:
+                hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+                hdr.resizeSection(i, max(header_min, content_min))
 
     def _row_strings_for_message(self, m: dict) -> List[str]:
         tz = self._timezone_name
@@ -547,6 +751,42 @@ class SavedSearchesTreeProxyStyle(QProxyStyle):
         super().drawPrimitive(element, option, painter, widget)
 
 
+# Extra item data for saved-search run criteria (UserRole holds ("search", id)).
+_SEARCH_CRITERIA_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+class SavedSearchesTreeDelegate(QStyledItemDelegate):
+    """Saved-search rows: full-row highlight when selected; no hover fill when not selected."""
+
+    def __init__(self, tree: QTreeWidget, parent=None):
+        super().__init__(parent)
+        self._tree = tree
+
+    def _is_search_item(self, index) -> bool:
+        item = self._tree.itemFromIndex(index)
+        return SavedSearchesTree._item_is_search(item)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        if not self._is_search_item(index):
+            super().paint(painter, option, index)
+            return
+        item = self._tree.itemFromIndex(index)
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        selected = item is not None and item.isSelected()
+        opt.state &= ~(
+            QStyle.StateFlag.State_Selected
+            | QStyle.StateFlag.State_MouseOver
+            | QStyle.StateFlag.State_HasFocus
+        )
+        opt.backgroundBrush = QBrush(Qt.GlobalColor.transparent)
+        if selected:
+            text_color = QColor(_SEARCH_SELECTED_TEXT)
+            opt.palette.setColor(QPalette.ColorRole.Text, text_color)
+            opt.palette.setColor(QPalette.ColorRole.WindowText, text_color)
+        super().paint(painter, opt, index)
+
+
 class SavedSearchesTree(QTreeWidget):
     """Tree of folders + saved searches. Supports internal drag-drop with persistence."""
 
@@ -561,124 +801,175 @@ class SavedSearchesTree(QTreeWidget):
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        # DragDrop (not InternalMove): item widgets detach on internal move; we persist + rebuild.
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._app_data_root: Optional[Path] = None
         self._case_id: Optional[str] = None
+        self._drag_source_item: Optional[QTreeWidgetItem] = None
         # Fusion keeps whole-row selection aligned with QSS; proxy paints disclosure chevrons
         # because Fusion ignores branch `image:` in stylesheets on Windows.
         base = QStyleFactory.create("Fusion") or QApplication.style()
         proxy = SavedSearchesTreeProxyStyle(base)
         proxy.setParent(self)
         self.setStyle(proxy)
+        self.setItemDelegate(SavedSearchesTreeDelegate(self, self))
+
+    @staticmethod
+    def _item_is_search(item: Optional[QTreeWidgetItem]) -> bool:
+        if item is None:
+            return False
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        return isinstance(data, tuple) and data[0] == "search"
+
+    def drawRow(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        item = self.itemFromIndex(index)
+        if self._item_is_search(item):
+            if item is not None and item.isSelected():
+                full = QRect(option.rect)
+                full.setLeft(0)
+                full.setRight(self.viewport().width())
+                painter.fillRect(full, QColor(_SEARCH_SELECTED_BG))
+            row_opt = QStyleOptionViewItem(option)
+            row_opt.state &= ~(
+                QStyle.StateFlag.State_Selected
+                | QStyle.StateFlag.State_MouseOver
+                | QStyle.StateFlag.State_HasFocus
+            )
+            super().drawRow(painter, row_opt, index)
+            return
+        super().drawRow(painter, option, index)
 
     def set_saved_search_storage(self, p: Optional[Path], case_id: Optional[str]) -> None:
         self._app_data_root = p
         self._case_id = case_id
 
+    def startDrag(self, supportedActions) -> None:
+        self._drag_source_item = self.currentItem()
+        super().startDrag(supportedActions)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.source() is self:
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if event.source() is self:
+            event.acceptProposedAction()
+        super().dragMoveEvent(event)
+
     def dropEvent(self, event) -> None:
-        if self._app_data_root is None or self._case_id is None:
-            event.ignore()
-            return
-        source = self.currentItem()
-        if source is None:
-            event.ignore()
-            return
-        src_data = source.data(0, Qt.ItemDataRole.UserRole)
-        if not src_data or not isinstance(src_data, tuple):
-            event.ignore()
-            return
-        src_kind, src_id = src_data
+        try:
+            if self._app_data_root is None or self._case_id is None:
+                event.ignore()
+                return
+            source = self._drag_source_item or self.currentItem()
+            if source is None:
+                event.ignore()
+                return
+            src_data = source.data(0, Qt.ItemDataRole.UserRole)
+            if not src_data or not isinstance(src_data, tuple):
+                event.ignore()
+                return
+            src_kind, src_id = src_data
 
-        # The library root folder is fixed at the top and cannot be reparented.
-        if src_kind == "folder" and is_library_root_folder_id(src_id):
-            event.ignore()
-            return
+            # The library root folder is fixed at the top and cannot be reparented.
+            if src_kind == "folder" and is_library_root_folder_id(src_id):
+                event.ignore()
+                return
 
-        target = self.itemAt(event.position().toPoint())
-        indicator = self.dropIndicatorPosition()
+            target = self.itemAt(event.position().toPoint())
+            indicator = self.dropIndicatorPosition()
 
-        def _parent_folder_id(item) -> str:
-            parent = item.parent()
-            if parent is None:
+            def _parent_folder_id(item) -> str:
+                parent = item.parent()
+                if parent is None:
+                    return LIBRARY_ROOT_FOLDER_ID
+                pd = parent.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(pd, tuple) and pd[0] == "folder":
+                    return pd[1]
                 return LIBRARY_ROOT_FOLDER_ID
-            pd = parent.data(0, Qt.ItemDataRole.UserRole)
-            if isinstance(pd, tuple) and pd[0] == "folder":
-                return pd[1]
-            return LIBRARY_ROOT_FOLDER_ID
 
-        if target is None:
-            target_folder_id = LIBRARY_ROOT_FOLDER_ID
-        else:
-            tgt_data = target.data(0, Qt.ItemDataRole.UserRole)
-            tgt_kind = tgt_data[0] if isinstance(tgt_data, tuple) else None
-            tgt_id = tgt_data[1] if isinstance(tgt_data, tuple) else None
-            if (
-                indicator == QAbstractItemView.DropIndicatorPosition.OnItem
-                and tgt_kind == "folder"
-            ):
-                target_folder_id = tgt_id
+            if target is None:
+                target_folder_id = LIBRARY_ROOT_FOLDER_ID
             else:
-                target_folder_id = _parent_folder_id(target)
+                tgt_data = target.data(0, Qt.ItemDataRole.UserRole)
+                tgt_kind = tgt_data[0] if isinstance(tgt_data, tuple) else None
+                tgt_id = tgt_data[1] if isinstance(tgt_data, tuple) else None
+                if (
+                    indicator == QAbstractItemView.DropIndicatorPosition.OnItem
+                    and tgt_kind == "folder"
+                ):
+                    target_folder_id = tgt_id
+                else:
+                    target_folder_id = _parent_folder_id(target)
 
-        if src_kind == "folder":
-            if move_folder(self._app_data_root, self._case_id, src_id, target_folder_id) is None:
+            if src_kind == "folder":
+                if move_folder(self._app_data_root, self._case_id, src_id, target_folder_id) is None:
+                    event.ignore()
+                    return
+            elif src_kind == "search":
+                if update_saved_search(self._app_data_root, self._case_id, src_id, folder_id=target_folder_id) is None:
+                    event.ignore()
+                    return
+            else:
                 event.ignore()
                 return
-        elif src_kind == "search":
-            if update_saved_search(self._app_data_root, self._case_id, src_id, folder_id=target_folder_id) is None:
-                event.ignore()
-                return
-        else:
-            event.ignore()
-            return
 
-        event.accept()
-        self.item_moved.emit()
+            event.accept()
+            self.item_moved.emit()
+        finally:
+            self._drag_source_item = None
 
 
 class MessageViews(QWidget):
     """Tabs: Threads, Table (full backup), Search (saved searches left, results table right)."""
     add_search_requested = pyqtSignal(object)  # default folder id (str or None)
-    run_saved_search_requested = pyqtSignal(dict)  # criteria dict
+    edit_search_requested = pyqtSignal(str)  # saved search id
+    run_saved_search_requested = pyqtSignal(dict)  # criteria dict (e.g. after Save & Search in dialog)
+    search_selected = pyqtSignal(dict)  # criteria dict when user selects a saved search
     export_rsmf_requested = pyqtSignal()  # request to export current search results
-    export_thread_rsmf_requested = pyqtSignal(int)  # request to export a specific thread (chat rowid)
+    export_threads_rsmf_requested = pyqtSignal(list)  # chat rowids to export
     full_table_tab_loaded = pyqtSignal()  # user loaded deferred Table tab; persist preference in meta
 
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         self._tabs = QTabWidget()
         # Tab 0: Threads (chat list + thread view)
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget()
+        left.setMinimumWidth(_LEFT_SIDEBAR_WIDTH)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
         self._search = QLineEdit()
         self._search.setPlaceholderText("Filter by chat participant name or phone number")
         self._search.textChanged.connect(self._apply_search)
-        left_layout.addWidget(self._search)
+        left_layout.addWidget(_make_side_toolbar_row(leading=self._search))
         self._chat_list = QListWidget()
-        self._chat_list.setMinimumWidth(180)
+        self._chat_list.setMinimumWidth(_LEFT_SIDEBAR_WIDTH - 20)
         self._chat_list.currentRowChanged.connect(self._on_chat_selection)
-        left_layout.addWidget(self._chat_list)
+        self._chat_list.itemChanged.connect(self._on_chat_item_changed)
+        left_layout.addWidget(self._chat_list, 1)
         self._splitter.addWidget(left)
         right_pane = QWidget()
         right_pane_layout = QVBoxLayout(right_pane)
         right_pane_layout.setContentsMargins(0, 0, 0, 0)
-        thread_export_row = QHBoxLayout()
-        thread_export_row.addStretch()
+        right_pane_layout.setSpacing(0)
         self._export_thread_btn = QPushButton("  Export RSMF")
         self._export_thread_btn.setIcon(load_icon("download"))
         self._export_thread_btn.setIconSize(QSize(14, 14))
         self._export_thread_btn.setToolTip(
-            "Export this thread to Relativity Short Message Format (with optional filters)"
+            "Export checked threads to Relativity Short Message Format (with optional filters)"
         )
         self._export_thread_btn.setEnabled(False)
         self._export_thread_btn.clicked.connect(self._on_export_thread_clicked)
-        thread_export_row.addWidget(self._export_thread_btn)
-        right_pane_layout.addLayout(thread_export_row)
+        right_pane_layout.addWidget(_make_side_toolbar_row(trailing=self._export_thread_btn))
         self._stack = QStackedWidget()
         self._thread_view = ThreadView()
         self._stack.addWidget(self._thread_view)
@@ -690,7 +981,8 @@ class MessageViews(QWidget):
         self._thread_view.image_clicked.connect(self._show_lightbox)
         right_pane_layout.addWidget(self._view_stack, 1)
         self._splitter.addWidget(right_pane)
-        self._splitter.setSizes([200, 600])
+        self._splitter.setSizes([_LEFT_SIDEBAR_WIDTH, 680])
+        _lock_horizontal_splitter(self._splitter)
         self._tabs.addTab(self._splitter, "Threads View")
         # Tab 1: Table view (hidden until populated if import deferred Table tab)
         table_tab = QWidget()
@@ -701,42 +993,57 @@ class MessageViews(QWidget):
         self._table_tab_index = self._tabs.addTab(table_tab, "Table View")
         # Tab 2: Search — left = saved searches tree (right-click folders to add searches/subfolders), right = results table
         search_tab = QWidget()
-        search_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._search_splitter = QSplitter(Qt.Orientation.Horizontal)
         search_left = QWidget()
+        search_left.setMinimumWidth(_LEFT_SIDEBAR_WIDTH)
         search_left_layout = QVBoxLayout(search_left)
         search_left_layout.setContentsMargins(0, 0, 0, 0)
+        search_left_layout.setSpacing(0)
         self._saved_searches_tree = SavedSearchesTree()
-        self._saved_searches_tree.setMinimumWidth(200)
+        self._saved_searches_tree.setMinimumWidth(_LEFT_SIDEBAR_WIDTH - 20)
         self._saved_searches_tree.item_moved.connect(self._refresh_saved_searches_tree)
         self._saved_searches_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
-        search_left_layout.addWidget(self._saved_searches_tree)
-        search_splitter.addWidget(search_left)
+        self._saved_searches_tree.currentItemChanged.connect(self._on_saved_search_tree_selection)
+        search_left_layout.addWidget(_make_side_toolbar_row())
+        search_left_layout.addWidget(self._saved_searches_tree, 1)
+        self._search_splitter.addWidget(search_left)
         search_right = QWidget()
         search_right_layout = QVBoxLayout(search_right)
-        export_row = QHBoxLayout()
-        export_row.addStretch()
+        search_right_layout.setContentsMargins(0, 0, 0, 0)
+        search_right_layout.setSpacing(0)
         self._export_rsmf_btn = QPushButton("  Export RSMF")
         self._export_rsmf_btn.setIcon(load_icon("download"))
         self._export_rsmf_btn.setIconSize(QSize(14, 14))
         self._export_rsmf_btn.setToolTip("Export current search results to Relativity Short Message Format")
         self._export_rsmf_btn.clicked.connect(self.export_rsmf_requested.emit)
-        export_row.addWidget(self._export_rsmf_btn)
-        search_right_layout.addLayout(export_row)
-        self._search_placeholder = QLabel(
-            "Right-click the top folder (named after this case by default) or any subfolder "
-            "to create a new search or subfolder."
-        )
-        self._search_placeholder.setProperty("class", "placeholder")
-        self._search_placeholder.setWordWrap(True)
-        search_right_layout.addWidget(self._search_placeholder)
+        search_right_layout.addWidget(_make_side_toolbar_row(trailing=self._export_rsmf_btn))
+        self._search_empty_state = QWidget()
+        search_empty_layout = QVBoxLayout(self._search_empty_state)
+        search_empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        search_logo = QLabel()
+        lockup_path = resolve_logo_path("guru_logo_lockup")
+        if lockup_path.is_file():
+            pix = QPixmap(str(lockup_path))
+            if not pix.isNull():
+                pix = pix.scaled(
+                    320,
+                    110,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                search_logo.setPixmap(pix)
+        search_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        search_empty_layout.addWidget(search_logo)
+        search_right_layout.addWidget(self._search_empty_state, 1)
         self._search_table_view = TableView()
         self._search_table_view.setVisible(False)
-        search_right_layout.addWidget(self._search_table_view)
-        search_splitter.addWidget(search_right)
-        search_splitter.setSizes([200, 600])
+        search_right_layout.addWidget(self._search_table_view, 1)
+        self._search_splitter.addWidget(search_right)
+        self._search_splitter.setSizes([_LEFT_SIDEBAR_WIDTH, 680])
+        _lock_horizontal_splitter(self._search_splitter)
         search_tab_layout = QVBoxLayout(search_tab)
         search_tab_layout.setContentsMargins(0, 0, 0, 0)
-        search_tab_layout.addWidget(search_splitter)
+        search_tab_layout.addWidget(self._search_splitter)
         self._tabs.addTab(search_tab, "Search Messages")
         layout.addWidget(self._tabs)
         self._tabs.currentChanged.connect(self._on_search_tab_activated)
@@ -749,8 +1056,13 @@ class MessageViews(QWidget):
         self._all_messages: List[dict] = []
         self._search_results: List[dict] = []
         self._current_search_id: Optional[str] = None
+        self._current_search_chunk_24h: bool = False
+        self._current_search_name: str = ""
+        self._suppress_search_selection_run: bool = False
         self._attachment_base: Optional[Path] = None
         self._current_chat_rowid: Optional[int] = None
+        self._checked_chat_ids: Set[int] = set()
+        self._rebuilding_chat_list: bool = False
         self._table_tab_deferred: bool = False
 
     def is_table_tab_deferred(self) -> bool:
@@ -787,35 +1099,20 @@ class MessageViews(QWidget):
         if index == 2:
             self._refresh_saved_searches_tree()
 
-    def _build_search_row_widget(self, search: dict, criteria: dict) -> QWidget:
-        """Build the inline label + Run + Delete buttons for a saved-search tree row."""
-        name = search.get("name") or "Unnamed"
-        seq = search.get("sequence") or 0
-        search_id = search.get("id")
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(2, 2, 2, 2)
-        lbl = QLabel(f"[{seq:04d}] {name}")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        lbl.setWordWrap(True)
-        row_layout.addWidget(lbl, 1)
-        run_btn = QPushButton()
-        run_btn.setIcon(load_icon("search"))
-        run_btn.setIconSize(QSize(16, 16))
-        run_btn.setProperty("class", "icon-btn")
-        run_btn.setToolTip("Run search")
-        run_btn.setFixedSize(28, 28)
-        run_btn.clicked.connect(lambda checked=False, c=criteria: self.run_saved_search_requested.emit(c))
-        row_layout.addWidget(run_btn, 0)
-        delete_btn = QPushButton()
-        delete_btn.setIcon(load_icon("trash"))
-        delete_btn.setIconSize(QSize(16, 16))
-        delete_btn.setProperty("class", "icon-btn")
-        delete_btn.setToolTip("Delete search")
-        delete_btn.setFixedSize(28, 28)
-        delete_btn.clicked.connect(lambda checked=False, sid=search_id: self._on_delete_search(sid))
-        row_layout.addWidget(delete_btn, 0)
-        return row
+    def _search_criteria_dict(self, s: dict, index: int) -> dict:
+        return {
+            "to_filter": s.get("to_filter", ""),
+            "body_filter": s.get("body_filter", ""),
+            "date_from": s.get("date_from", ""),
+            "date_to": s.get("date_to", ""),
+            "has_attachments": s.get("has_attachments", "any"),
+            "hash_filter": s.get("hash_filter", ""),
+            "chunk_24h": s.get("chunk_24h", False),
+            "thread_ids": s.get("thread_ids") or [],
+            "search_name": s.get("name") or "Search results",
+            "sequence": s.get("sequence", index + 1),
+            "search_id": s.get("id"),
+        }
 
     def _refresh_saved_searches_tree(self) -> None:
         tree = self._saved_searches_tree
@@ -841,94 +1138,105 @@ class MessageViews(QWidget):
         if not self._app_data_root or not self._case_id:
             return
 
-        folders = load_folders(
-            self._app_data_root,
-            self._case_id,
-            library_display_name=self._library_display_name,
-        )
-        searches = load_saved_searches(
-            self._app_data_root,
-            self._case_id,
-            library_display_name=self._library_display_name,
-        )
-
-        folder_items: Dict[str, QTreeWidgetItem] = {}
-        for folder, depth in walk_folders_depth_first(folders):
-            fid = folder.get("id")
-            item = QTreeWidgetItem()
-            item.setText(0, folder.get("name") or "Unnamed folder")
-            item.setIcon(0, load_icon("folder"))
-            item.setData(0, Qt.ItemDataRole.UserRole, ("folder", fid))
-            item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsDragEnabled
-                | Qt.ItemFlag.ItemIsDropEnabled
+        self._suppress_search_selection_run = True
+        try:
+            folders = load_folders(
+                self._app_data_root,
+                self._case_id,
+                library_display_name=self._library_display_name,
             )
-            parent_id = folder.get("parent_id")
-            parent_item = folder_items.get(parent_id) if parent_id else None
-            if parent_item is None:
-                tree.addTopLevelItem(item)
-            else:
-                parent_item.addChild(item)
-            folder_items[fid] = item
-
-        for i, s in enumerate(searches):
-            criteria = {
-                "to_filter": s.get("to_filter", ""),
-                "body_filter": s.get("body_filter", ""),
-                "date_from": s.get("date_from", ""),
-                "date_to": s.get("date_to", ""),
-                "has_attachments": s.get("has_attachments", "any"),
-                "hash_filter": s.get("hash_filter", ""),
-                "chunk_24h": s.get("chunk_24h", False),
-                "search_name": s.get("name") or "Search results",
-                "sequence": s.get("sequence", i + 1),
-                "search_id": s.get("id"),
-            }
-            item = QTreeWidgetItem()
-            item.setData(0, Qt.ItemDataRole.UserRole, ("search", s.get("id")))
-            item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsDragEnabled
+            searches = load_saved_searches(
+                self._app_data_root,
+                self._case_id,
+                library_display_name=self._library_display_name,
             )
-            folder_id = s.get("folder_id")
-            parent_item = folder_items.get(folder_id) if folder_id else None
-            if parent_item is None:
-                tree.addTopLevelItem(item)
-            else:
-                parent_item.addChild(item)
-            tree.setItemWidget(item, 0, self._build_search_row_widget(s, criteria))
 
-        # Restore expansion state for folders that still exist; expand all by default on first render.
-        def restore_expansion(item: QTreeWidgetItem) -> None:
-            data = item.data(0, Qt.ItemDataRole.UserRole)
-            if isinstance(data, tuple) and data[0] == "folder":
-                fid = data[1]
-                item.setExpanded(fid in expanded if expanded else True)
-            for i in range(item.childCount()):
-                restore_expansion(item.child(i))
+            folder_items: Dict[str, QTreeWidgetItem] = {}
+            for folder, depth in walk_folders_depth_first(folders):
+                fid = folder.get("id")
+                item = QTreeWidgetItem()
+                item.setText(0, folder.get("name") or "Unnamed folder")
+                item.setIcon(0, load_icon("folder"))
+                item.setData(0, Qt.ItemDataRole.UserRole, ("folder", fid))
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                    | Qt.ItemFlag.ItemIsDropEnabled
+                )
+                parent_id = folder.get("parent_id")
+                parent_item = folder_items.get(parent_id) if parent_id else None
+                if parent_item is None:
+                    tree.addTopLevelItem(item)
+                else:
+                    parent_item.addChild(item)
+                folder_items[fid] = item
 
-        for i in range(tree.invisibleRootItem().childCount()):
-            restore_expansion(tree.invisibleRootItem().child(i))
+            for i, s in enumerate(searches):
+                criteria = self._search_criteria_dict(s, i)
+                seq = s.get("sequence") or (i + 1)
+                name = s.get("name") or "Unnamed"
+                item = QTreeWidgetItem()
+                item.setText(0, f"[{seq:04d}] {name}")
+                item.setIcon(0, load_icon("search"))
+                item.setData(0, Qt.ItemDataRole.UserRole, ("search", s.get("id")))
+                item.setData(0, _SEARCH_CRITERIA_ROLE, criteria)
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                )
+                folder_id = s.get("folder_id")
+                parent_item = folder_items.get(folder_id) if folder_id else None
+                if parent_item is None:
+                    tree.addTopLevelItem(item)
+                else:
+                    parent_item.addChild(item)
 
-        # Restore selection if possible.
-        if selected_data:
-            def find_by_data(item: QTreeWidgetItem) -> Optional[QTreeWidgetItem]:
-                if item.data(0, Qt.ItemDataRole.UserRole) == selected_data:
-                    return item
-                for j in range(item.childCount()):
-                    found = find_by_data(item.child(j))
-                    if found is not None:
-                        return found
-                return None
+            # Restore expansion state for folders that still exist; expand all by default on first render.
+            def restore_expansion(item: QTreeWidgetItem) -> None:
+                data = item.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(data, tuple) and data[0] == "folder":
+                    fid = data[1]
+                    item.setExpanded(fid in expanded if expanded else True)
+                for i in range(item.childCount()):
+                    restore_expansion(item.child(i))
 
             for i in range(tree.invisibleRootItem().childCount()):
-                found = find_by_data(tree.invisibleRootItem().child(i))
-                if found is not None:
-                    tree.setCurrentItem(found)
-                    break
+                restore_expansion(tree.invisibleRootItem().child(i))
+
+            # Restore selection if possible.
+            if selected_data:
+                def find_by_data(item: QTreeWidgetItem) -> Optional[QTreeWidgetItem]:
+                    if item.data(0, Qt.ItemDataRole.UserRole) == selected_data:
+                        return item
+                    for j in range(item.childCount()):
+                        found = find_by_data(item.child(j))
+                        if found is not None:
+                            return found
+                    return None
+
+                for i in range(tree.invisibleRootItem().childCount()):
+                    found = find_by_data(tree.invisibleRootItem().child(i))
+                    if found is not None:
+                        tree.setCurrentItem(found)
+                        break
+        finally:
+            self._suppress_search_selection_run = False
+
+    def _on_saved_search_tree_selection(
+        self,
+        current: Optional[QTreeWidgetItem],
+        _previous: Optional[QTreeWidgetItem],
+    ) -> None:
+        if self._suppress_search_selection_run or current is None:
+            return
+        data = current.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, tuple) or data[0] != "search":
+            return
+        criteria = current.data(0, _SEARCH_CRITERIA_ROLE)
+        if isinstance(criteria, dict):
+            self.search_selected.emit(criteria)
 
     def get_selected_folder_id(self) -> str:
         """Return the folder id of the currently selected folder, the parent folder of
@@ -987,7 +1295,10 @@ class MessageViews(QWidget):
                 menu.addAction("Rename folder...", lambda: self._on_rename_folder(ident))
                 menu.addAction("Delete folder...", lambda: self._on_delete_folder(ident))
         elif kind == "search":
-            menu.addAction("Move to folder...", lambda: self._on_move_search(ident))
+            menu.addAction("Edit Search", lambda: self.edit_search_requested.emit(ident))
+            menu.addAction("Rename Search", lambda: self._on_rename_search(ident))
+            menu.addSeparator()
+            menu.addAction("Delete Search", lambda: self._on_delete_search(ident))
         if menu.isEmpty():
             return
         menu.exec(tree.viewport().mapToGlobal(pos))
@@ -1050,32 +1361,25 @@ class MessageViews(QWidget):
                 self.clear_search_results()
         self._refresh_saved_searches_tree()
 
-    def _on_move_search(self, search_id: str) -> None:
+    def _on_rename_search(self, search_id: str) -> None:
         if not self._app_data_root or not self._case_id:
             return
-        folders = load_folders(self._app_data_root, self._case_id)
-        labels: List[str] = []
-        ids: List[str] = []
-        for folder, depth in walk_folders_depth_first(folders):
-            labels.append(("    " * depth) + (folder.get("name") or "Unnamed folder"))
-            ids.append(folder.get("id"))
-        if not labels:
+        searches = load_saved_searches(self._app_data_root, self._case_id)
+        current = next((s for s in searches if s.get("id") == search_id), None)
+        if current is None:
             return
-        choice, ok = QInputDialog.getItem(
+        name, ok = QInputDialog.getText(
             self,
-            "Move search",
-            "Move to folder:",
-            labels,
-            0,
-            False,
+            "Rename Search",
+            "Search name:",
+            text=current.get("name") or "",
         )
         if not ok:
             return
-        try:
-            target_id = ids[labels.index(choice)]
-        except ValueError:
+        name = (name or "").strip()
+        if not name:
             return
-        update_saved_search(self._app_data_root, self._case_id, search_id, folder_id=target_id)
+        update_saved_search(self._app_data_root, self._case_id, search_id, name=name)
         self._refresh_saved_searches_tree()
 
     def _on_delete_search(self, search_id: Optional[str]) -> None:
@@ -1096,14 +1400,28 @@ class MessageViews(QWidget):
                 self.clear_search_results()
             self._refresh_saved_searches_tree()
 
+    def _update_export_thread_btn(self) -> None:
+        self._export_thread_btn.setEnabled(len(self._checked_chat_ids) >= 1)
+
+    def _on_chat_item_changed(self, item: QListWidgetItem) -> None:
+        if self._rebuilding_chat_list:
+            return
+        rowid = item.data(Qt.ItemDataRole.UserRole)
+        if rowid is None:
+            return
+        cid = int(rowid)
+        if item.checkState() == Qt.CheckState.Checked:
+            self._checked_chat_ids.add(cid)
+        else:
+            self._checked_chat_ids.discard(cid)
+        self._update_export_thread_btn()
+
     def _on_chat_selection(self, row: int) -> None:
         if row < 0 or not self._filtered_chats or row >= len(self._filtered_chats):
-            self._export_thread_btn.setEnabled(False)
             return
         chat = self._filtered_chats[row]
         cid = chat.get("rowid")
         self._current_chat_rowid = cid
-        self._export_thread_btn.setEnabled(cid is not None)
         msgs = self._chat_id_to_messages.get(cid, [])
         if not msgs:
             self._thread_view.set_messages([], self._attachment_base)
@@ -1112,9 +1430,34 @@ class MessageViews(QWidget):
         # Table view always shows all messages; do not change it here
 
     def _on_export_thread_clicked(self) -> None:
-        if self._current_chat_rowid is None:
+        if not self._checked_chat_ids:
             return
-        self.export_thread_rsmf_requested.emit(int(self._current_chat_rowid))
+        ordered = [
+            ch["rowid"]
+            for ch in self._chats
+            if ch.get("rowid") in self._checked_chat_ids
+        ]
+        self.export_threads_rsmf_requested.emit(ordered)
+
+    def get_checked_threads_for_export(self) -> List[dict]:
+        """Return {label, messages} dicts for each checked chat rowid."""
+        out: List[dict] = []
+        for ch in self._chats:
+            cid = ch.get("rowid")
+            if cid not in self._checked_chat_ids:
+                continue
+            out.append({
+                "label": ch.get("label") or f"Chat {cid}",
+                "messages": list(self._chat_id_to_messages.get(cid, [])),
+            })
+        return out
+
+    def get_chat_id_to_label(self) -> Dict[int, str]:
+        return {ch.get("rowid"): ch.get("label") or "" for ch in self._chats if ch.get("rowid") is not None}
+
+    def get_chats_for_search_picker(self) -> List[dict]:
+        """Thread rows for saved-search picker (same labels as sidebar)."""
+        return list(self._chats)
 
     def get_messages_for_chat(self, chat_rowid: int) -> List[dict]:
         """Return messages belonging to a specific chat rowid."""
@@ -1147,8 +1490,21 @@ class MessageViews(QWidget):
                 or q in (c.get("chat_identifier") or "").lower()
             ]
         self._chat_list.clear()
-        for ch in self._filtered_chats:
-            self._chat_list.addItem(f"{ch['label']} ({ch['count']})")
+        self._rebuilding_chat_list = True
+        try:
+            for ch in self._filtered_chats:
+                cid = ch.get("rowid")
+                item = QListWidgetItem(f"{ch['label']} ({ch['count']})")
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setData(Qt.ItemDataRole.UserRole, cid)
+                if cid in self._checked_chat_ids:
+                    item.setCheckState(Qt.CheckState.Checked)
+                else:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                self._chat_list.addItem(item)
+        finally:
+            self._rebuilding_chat_list = False
+        self._update_export_thread_btn()
         if self._filtered_chats and self._current_chat_rowid is not None:
             for i, ch in enumerate(self._filtered_chats):
                 if ch.get("rowid") == self._current_chat_rowid:
@@ -1237,7 +1593,8 @@ class MessageViews(QWidget):
         self._chats.sort(key=lambda ch: self._label_sort_key(ch["label"]))
         self._filtered_chats = list(self._chats)
         self._current_chat_rowid = None
-        self._export_thread_btn.setEnabled(False)
+        self._checked_chat_ids = set()
+        self._update_export_thread_btn()
         self._apply_search()
         self._thread_view.set_messages([], attachment_base)
         # Table view: all messages, sorted by date (optional skip for faster import / open)
@@ -1258,23 +1615,32 @@ class MessageViews(QWidget):
         # Clear Search tab when loading new backup
         self._search_results = []
         self._current_search_id = None
+        self._current_search_chunk_24h = False
+        self._current_search_name = ""
         self._search_table_view.set_messages([], self._timezone_name)
         self._search_table_view.setVisible(False)
-        self._search_placeholder.setVisible(True)
+        self._search_empty_state.setVisible(True)
         if self._filtered_chats:
             self._chat_list.setCurrentRow(0)
             self._on_chat_selection(0)
 
     def show_thread_view(self) -> None:
         self._splitter.widget(0).setVisible(True)
-        self._splitter.setSizes([200, 600])
+        self._splitter.setSizes([_LEFT_SIDEBAR_WIDTH, 680])
         self._tabs.setCurrentIndex(0)
 
     def show_table_view(self) -> None:
         if self._tabs.isTabVisible(self._table_tab_index):
             self._tabs.setCurrentIndex(self._table_tab_index)
 
-    def set_search_results(self, messages: List[dict], search_id: Optional[str] = None) -> None:
+    def set_search_results(
+        self,
+        messages: List[dict],
+        search_id: Optional[str] = None,
+        *,
+        chunk_24h: bool = False,
+        search_name: str = "",
+    ) -> None:
         """Populate the Search tab's table and switch to Search tab. Does not affect the Table tab."""
         sorted_msgs = sorted(
             messages,
@@ -1282,8 +1648,10 @@ class MessageViews(QWidget):
         )
         self._search_results = sorted_msgs
         self._current_search_id = search_id
+        self._current_search_chunk_24h = bool(chunk_24h)
+        self._current_search_name = (search_name or "").strip()
         self._search_table_view.set_messages(sorted_msgs, self._timezone_name)
-        self._search_placeholder.setVisible(False)
+        self._search_empty_state.setVisible(False)
         self._search_table_view.setVisible(True)
         self._tabs.setCurrentIndex(2)
 
@@ -1304,13 +1672,22 @@ class MessageViews(QWidget):
         """Clear the Search tab's table and show placeholder."""
         self._search_results = []
         self._current_search_id = None
+        self._current_search_chunk_24h = False
+        self._current_search_name = ""
         self._search_table_view.set_messages([], getattr(self, "_timezone_name", ""))
         self._search_table_view.setVisible(False)
-        self._search_placeholder.setVisible(True)
+        self._search_empty_state.setVisible(True)
 
     def get_search_results(self) -> List[dict]:
         """Return current search results for RSMF export."""
         return self._search_results
+
+    def get_current_search_chunk_24h(self) -> bool:
+        """Whether the active search results used 24-hour conversation chunking."""
+        return self._current_search_chunk_24h
+
+    def get_current_search_name(self) -> str:
+        return self._current_search_name
 
     def show_chat(self, chat_rowid: int) -> None:
         msgs = self._chat_id_to_messages.get(chat_rowid, [])

@@ -6,7 +6,7 @@ Saved criteria always use attachments=any and no hash filter (UI removed).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from PyQt6.QtWidgets import (
     QDialog,
@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (
     QCalendarWidget,
     QAbstractSpinBox,
     QWidget,
+    QListWidget,
+    QListWidgetItem,
 )
 from PyQt6.QtCore import QDate, Qt, QSize, pyqtSignal
 
@@ -31,6 +33,7 @@ from app.saved_searches import (
     LIBRARY_ROOT_FOLDER_NAME,
     add_saved_search,
     load_folders,
+    update_saved_search,
     walk_folders_depth_first,
 )
 from app.style import icon as load_icon
@@ -43,6 +46,7 @@ def _criteria_from_form(
     date_to: str,
     chunk_24h: bool,
     search_name: str,
+    thread_ids: List[int],
 ) -> Dict[str, Any]:
     return {
         "to_filter": to_filter.strip(),
@@ -52,6 +56,7 @@ def _criteria_from_form(
         "has_attachments": "any",
         "hash_filter": "",
         "chunk_24h": bool(chunk_24h),
+        "thread_ids": thread_ids,
         "search_name": (search_name or "Search results").strip() or "Search results",
     }
 
@@ -68,11 +73,15 @@ class SearchDialog(QDialog):
         parent=None,
         default_folder_id: Optional[str] = None,
         library_display_name: Optional[str] = None,
+        edit_search: Optional[Dict[str, Any]] = None,
+        chats: Optional[List[dict]] = None,
     ):
         super().__init__(parent)
         self._app_data_root = Path(app_data_root)
         self._case_id = case_id
-        self.setWindowTitle("Search messages")
+        self._edit_search_id = (edit_search or {}).get("id")
+        self._chats = list(chats or [])
+        self.setWindowTitle("Edit search" if self._edit_search_id else "Search messages")
         self.setMinimumWidth(480)
         self.setWindowFlag(Qt.WindowType.MSWindowsFixedSizeDialogHint, True)
         layout = QVBoxLayout(self)
@@ -90,7 +99,7 @@ class SearchDialog(QDialog):
             library_display_name=library_display_name,
         )
         select_index = 0
-        target_id = default_folder_id or LIBRARY_ROOT_FOLDER_ID
+        target_id = (edit_search or {}).get("folder_id") or default_folder_id or LIBRARY_ROOT_FOLDER_ID
         for i, (folder, depth) in enumerate(walk_folders_depth_first(folders)):
             label = ("    " * depth) + (folder.get("name") or "Unnamed folder")
             self._folder_combo.addItem(label, folder.get("id"))
@@ -113,6 +122,22 @@ class SearchDialog(QDialog):
             "appear together are included."
         )
         form.addRow("Recipient:", self._to_edit)
+
+        self._threads_list = QListWidget()
+        self._threads_list.setMaximumHeight(140)
+        self._threads_list.setToolTip(
+            "Optional: limit search to selected threads. Leave all unchecked to search every thread."
+        )
+        for ch in self._chats:
+            cid = ch.get("rowid")
+            label = ch.get("label") or f"Chat {cid}"
+            count = ch.get("count", 0)
+            item = QListWidgetItem(f"{label} ({count})")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setData(Qt.ItemDataRole.UserRole, cid)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self._threads_list.addItem(item)
+        form.addRow("Threads:", self._threads_list)
 
         self._body_edit = QLineEdit()
         self._body_edit.setPlaceholderText("Message body contains...")
@@ -199,6 +224,31 @@ class SearchDialog(QDialog):
         self.adjustSize()
         self.setFixedSize(self.size())
 
+        if edit_search:
+            self._name_edit.setText(edit_search.get("name") or "")
+            self._to_edit.setText(edit_search.get("to_filter") or "")
+            self._body_edit.setText(edit_search.get("body_filter") or "")
+            self._set_date_edit_from_ymd(self._date_from_edit, edit_search.get("date_from") or "")
+            self._set_date_edit_from_ymd(self._date_to_edit, edit_search.get("date_to") or "")
+            self._chunk_24h_cb.setChecked(bool(edit_search.get("chunk_24h")))
+            selected_ids = {int(t) for t in (edit_search.get("thread_ids") or []) if t is not None}
+            for i in range(self._threads_list.count()):
+                item = self._threads_list.item(i)
+                cid = item.data(Qt.ItemDataRole.UserRole)
+                if cid is not None and int(cid) in selected_ids:
+                    item.setCheckState(Qt.CheckState.Checked)
+
+    def _set_date_edit_from_ymd(self, w: QDateEdit, ymd: str) -> None:
+        text = (ymd or "").strip()
+        if not text:
+            w.setDate(w.minimumDate())
+            return
+        parsed = QDate.fromString(text, "yyyy-MM-dd")
+        if parsed.isValid():
+            w.setDate(parsed)
+        else:
+            w.setDate(w.minimumDate())
+
     def _open_calendar_popup(self, date_edit: QDateEdit, anchor: QWidget) -> None:
         cal = QCalendarWidget(self)
         cal.setWindowFlags(Qt.WindowType.Popup)
@@ -227,6 +277,16 @@ class SearchDialog(QDialog):
             return ""
         return d.toString("yyyy-MM-dd")
 
+    def _selected_thread_ids(self) -> List[int]:
+        ids: List[int] = []
+        for i in range(self._threads_list.count()):
+            item = self._threads_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                cid = item.data(Qt.ItemDataRole.UserRole)
+                if cid is not None:
+                    ids.append(int(cid))
+        return ids
+
     def _get_criteria(self) -> Dict[str, Any]:
         return _criteria_from_form(
             self._to_edit.text(),
@@ -235,6 +295,7 @@ class SearchDialog(QDialog):
             self._date_to_ymd(self._date_to_edit),
             self._chunk_24h_cb.isChecked(),
             self._name_edit.text(),
+            self._selected_thread_ids(),
         )
 
     def _on_save_and_search(self) -> None:
@@ -244,19 +305,40 @@ class SearchDialog(QDialog):
             return
         criteria = self._get_criteria()
         folder_id = self._folder_combo.currentData() or LIBRARY_ROOT_FOLDER_ID
-        item = add_saved_search(
-            self._app_data_root,
-            self._case_id,
-            name=name,
-            to_filter=criteria["to_filter"],
-            body_filter=criteria["body_filter"],
-            date_from=criteria["date_from"],
-            date_to=criteria["date_to"],
-            has_attachments=criteria["has_attachments"],
-            hash_filter=criteria["hash_filter"],
-            chunk_24h=criteria["chunk_24h"],
-            folder_id=folder_id,
-        )
+        if self._edit_search_id:
+            item = update_saved_search(
+                self._app_data_root,
+                self._case_id,
+                self._edit_search_id,
+                name=name,
+                to_filter=criteria["to_filter"],
+                body_filter=criteria["body_filter"],
+                date_from=criteria["date_from"],
+                date_to=criteria["date_to"],
+                has_attachments=criteria["has_attachments"],
+                hash_filter=criteria["hash_filter"],
+                chunk_24h=criteria["chunk_24h"],
+                thread_ids=criteria["thread_ids"],
+                folder_id=folder_id,
+            )
+            if item is None:
+                QMessageBox.warning(self, "Edit search", "Could not update this search.")
+                return
+        else:
+            item = add_saved_search(
+                self._app_data_root,
+                self._case_id,
+                name=name,
+                to_filter=criteria["to_filter"],
+                body_filter=criteria["body_filter"],
+                date_from=criteria["date_from"],
+                date_to=criteria["date_to"],
+                has_attachments=criteria["has_attachments"],
+                hash_filter=criteria["hash_filter"],
+                chunk_24h=criteria["chunk_24h"],
+                thread_ids=criteria["thread_ids"],
+                folder_id=folder_id,
+            )
         run_criteria = {
             "to_filter": item["to_filter"],
             "body_filter": item["body_filter"],
@@ -265,6 +347,7 @@ class SearchDialog(QDialog):
             "has_attachments": item["has_attachments"],
             "hash_filter": item["hash_filter"],
             "chunk_24h": item["chunk_24h"],
+            "thread_ids": item.get("thread_ids") or [],
             "search_name": item["name"],
             "sequence": item["sequence"],
             "search_id": item["id"],

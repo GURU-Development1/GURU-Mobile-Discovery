@@ -2,11 +2,11 @@
  * Cloudflare Worker entry point for the GURU Mobile Discovery billing pipeline.
  *
  * Routes:
- *   POST /stripe/webhook  - Stripe -> Keygen license operations + email delivery
- *   GET  /healthz         - liveness probe
+ *   POST /lemonsqueezy/webhook  - Lemon Squeezy -> Keygen license operations + email delivery
+ *   GET  /healthz               - liveness probe
  */
 
-import { handleStripeWebhook } from "./stripe";
+import { handleLemonSqueezyWebhook } from "./lemon_squeezy";
 import type { Env } from "./types";
 
 export default {
@@ -17,8 +17,8 @@ export default {
       return new Response("ok", { status: 200 });
     }
 
-    if (request.method === "POST" && url.pathname === "/stripe/webhook") {
-      return handleStripeWebhook(request, env);
+    if (request.method === "POST" && url.pathname === "/lemonsqueezy/webhook") {
+      return handleLemonSqueezyWebhook(request, env);
     }
 
     return new Response("Not found", { status: 404 });

@@ -135,6 +135,7 @@ def run_search(
     timezone_name: str = "",
     search_name: str = "Search results",
     search_sequence: int = 0,
+    thread_ids: Optional[List[int]] = None,
 ) -> List[dict]:
     """
     Filter messages by criteria and assign conversation_id.
@@ -152,9 +153,16 @@ def run_search(
     hash_filter = (hash_filter or "").strip()
 
     recipient_tokens = _parse_recipient_tokens(to_filter)
+    thread_id_set: Optional[set] = None
+    if thread_ids:
+        thread_id_set = {int(t) for t in thread_ids if t is not None}
 
     filtered: List[dict] = []
     for m in messages:
+        if thread_id_set is not None:
+            cid = m.get("chat_id")
+            if cid is None or int(cid) not in thread_id_set:
+                continue
         if not _match_recipients_and(m, recipient_tokens):
             continue
 
@@ -199,6 +207,46 @@ def run_search(
         r20 = _random20_deterministic(seed)
         cid = f"{search_sequence:04d}{r20}"
         return [dict(m, conversation_id=cid) for m in filtered]
+
+
+def expand_results_for_rsmf_export(
+    search_results: List[dict],
+    all_messages: List[dict],
+    timezone_name: str = "",
+    chunk_24h: bool = False,
+) -> List[dict]:
+    """
+    Expand saved-search hits for RSMF export.
+
+    - chunk_24h: include every message from matching chats on each hit date (24h chunks).
+    - otherwise: include every message from each chat that appears in the results, using
+      the search's shared conversation_id (matches thread export coverage).
+    """
+    if not search_results:
+        return []
+    if chunk_24h:
+        return expand_results_to_full_threads(search_results, all_messages, timezone_name)
+
+    conv_id = search_results[0].get("conversation_id")
+    chat_ids = {m.get("chat_id") for m in search_results if m.get("chat_id") is not None}
+    if not chat_ids or not conv_id:
+        return list(search_results)
+
+    seen_rowids: set = set()
+    expanded: List[dict] = []
+    for m in all_messages:
+        if m.get("chat_id") not in chat_ids:
+            continue
+        rowid = m.get("rowid")
+        if rowid is not None and rowid in seen_rowids:
+            continue
+        if rowid is not None:
+            seen_rowids.add(rowid)
+        copy = dict(m)
+        copy["conversation_id"] = conv_id
+        expanded.append(copy)
+    expanded.sort(key=lambda x: (_message_unix_timestamp(x) or 0, x.get("rowid") or 0))
+    return expanded
 
 
 def expand_results_to_full_threads(

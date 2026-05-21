@@ -4,10 +4,10 @@ compatibility_date = "2024-09-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Default (dev / preview) environment uses the top-level config.
-# Run secrets with: wrangler secret put STRIPE_SECRET_KEY  (etc.)
+# Run secrets with: wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET  (etc.)
 
 [env.production]
 name = "gmd-billing-prod"
 
 # Production secrets are scoped per-env:
-#   wrangler secret put STRIPE_SECRET_KEY --env production
+#   wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET --env production

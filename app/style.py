@@ -250,7 +250,7 @@ QComboBox QAbstractItemView {
     background-color: #ffffff;
     border: 1px solid #e1e6ed;
     border-radius: 8px;
-    padding: 6px;
+    padding: 0 6px 6px 6px;
     outline: none;
     show-decoration-selected: 1;
     selection-background-color: #4a73b8;
@@ -325,7 +325,7 @@ QTreeWidget#CaseImportTree::item:selected:!active {
     color: white;
 }
 
-QHeaderView::section {
+QHeaderView:horizontal::section {
     background-color: #f0f3f7;
     padding: 9px 11px;
     border: none;
@@ -335,12 +335,22 @@ QHeaderView::section {
     color: #2c3441;
 }
 
-QHeaderView::section:hover {
+QHeaderView:horizontal::section:hover {
     background-color: #e6ecf3;
 }
 
-QHeaderView::section:first {
+QHeaderView:horizontal::section:first {
     border-top-left-radius: 0;
+}
+
+QHeaderView:vertical::section {
+    background-color: #f0f3f7;
+    padding: 2px 6px;
+    border: none;
+    border-right: 1px solid #d8dfe8;
+    border-bottom: 1px solid #eef1f5;
+    font-weight: 600;
+    color: #2c3441;
 }
 
 /* =========================================================
@@ -356,7 +366,7 @@ QTableWidget {
 }
 
 QTableWidget::item {
-    padding: 5px 9px;
+    padding: 4px 9px;
     color: #1f2937;
 }
 
@@ -414,7 +424,7 @@ QListWidget {
     background-color: #ffffff;
     border: 1px solid #e1e6ed;
     border-radius: 8px;
-    padding: 6px;
+    padding: 0 6px 6px 6px;
     outline: none;
 }
 
@@ -511,6 +521,14 @@ QSplitter::handle {
 
 QSplitter::handle:hover {
     background-color: #c9d4e2;
+}
+
+#MainCaseSplitter::handle {
+    width: 0;
+    height: 0;
+    margin: 0;
+    padding: 0;
+    border: none;
 }
 
 /* =========================================================

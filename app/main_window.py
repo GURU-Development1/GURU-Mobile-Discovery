@@ -33,7 +33,6 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QStyle,
     QLineEdit,
-    QTextBrowser,
     QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
@@ -43,6 +42,7 @@ from .import_dialog import ImportBackupDialog
 from .search_dialog import SearchDialog
 from .export_dialog import ExportRsmfDialog
 from .thread_export_dialog import ThreadExportDialog
+from .thread_export_preview_dialog import ThreadExportPreviewDialog
 from .message_views import MessageViews
 from .style import icon as load_icon, logo_path as resolve_logo_path
 from . import cache
@@ -50,7 +50,7 @@ from .import_worker import run_import, extract_attachments_to_cache
 from app.paths import get_app_data_root
 from app.backup_parser import resolve_display_name, is_placeholder_chat_identifier
 from app.backup_parser.parser import backup_appears_encrypted
-from app.search_logic import run_search, expand_results_to_full_threads
+from app.search_logic import run_search, expand_results_for_rsmf_export
 from app.version import __version__
 
 
@@ -81,8 +81,7 @@ def _save_cases(cases: Dict[str, str]) -> None:
 
 
 class CaseTreeWidget(QTreeWidget):
-    """Tree widget that clears selection when clicking empty space."""
-    empty_area_clicked = pyqtSignal()
+    """Case/backup tree; empty-area clicks do not clear the current backup selection."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -92,9 +91,6 @@ class CaseTreeWidget(QTreeWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             item = self.itemAt(event.position().toPoint())
             if item is None:
-                self.clearSelection()
-                self.setCurrentItem(None)
-                self.empty_area_clicked.emit()
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -362,21 +358,31 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter.setObjectName("MainCaseSplitter")
 
         # Case tree
-        tree_container = QWidget()
-        tree_layout = QVBoxLayout(tree_container)
+        self._tree_container = QWidget()
+        tree_layout = QVBoxLayout(self._tree_container)
         tree_layout.setContentsMargins(8, 8, 4, 8)
         tree_layout.setSpacing(8)
-        cases_heading = QLabel("CASES")
-        cases_heading.setProperty("class", "section-heading")
-        tree_layout.addWidget(cases_heading)
-        add_case_btn = QPushButton("  New Case")
-        add_case_btn.setIcon(load_icon("plus"))
-        add_case_btn.setIconSize(QSize(14, 14))
-        add_case_btn.clicked.connect(self._add_case)
-        tree_layout.addWidget(add_case_btn)
+        cases_header = QHBoxLayout()
+        self._cases_heading = QLabel("CASES")
+        self._cases_heading.setProperty("class", "section-heading")
+        cases_header.addWidget(self._cases_heading)
+        cases_header.addStretch()
+        self._toggle_cases_btn = QPushButton()
+        self._toggle_cases_btn.setProperty("class", "icon-btn")
+        self._toggle_cases_btn.setFixedSize(28, 28)
+        self._toggle_cases_btn.setIconSize(QSize(14, 14))
+        self._toggle_cases_btn.clicked.connect(self._toggle_cases_panel)
+        cases_header.addWidget(self._toggle_cases_btn)
+        tree_layout.addLayout(cases_header)
+        self._add_case_btn = QPushButton("  New Case")
+        self._add_case_btn.setIcon(load_icon("plus"))
+        self._add_case_btn.setIconSize(QSize(14, 14))
+        self._add_case_btn.clicked.connect(self._add_case)
+        tree_layout.addWidget(self._add_case_btn)
         self._tree = CaseTreeWidget()
         self._tree.setHeaderLabels(["Cases"])
         self._tree.setHeaderHidden(True)
@@ -389,10 +395,9 @@ class MainWindow(QMainWindow):
         self._tree.itemExpanded.connect(self._on_tree_item_expanded_collapsed)
         self._tree.itemCollapsed.connect(self._on_tree_item_expanded_collapsed)
         self._tree.currentItemChanged.connect(self._on_tree_selection_changed)
-        self._tree.empty_area_clicked.connect(self._on_tree_empty_click)
         tree_layout.addWidget(self._tree)
-        splitter.addWidget(tree_container)
-        self._tree.setMinimumWidth(220)
+        self._main_splitter.addWidget(self._tree_container)
+        self._tree.setMinimumWidth(280)
         self._item_to_case_id: Dict[int, str] = {}  # id(item) -> case_id
         self._item_to_backup_id: Dict[int, Optional[str]] = {}  # id(item) -> backup_id or None
 
@@ -406,9 +411,15 @@ class MainWindow(QMainWindow):
         msg_panel_layout = QVBoxLayout(self._message_panel)
         self._message_views = MessageViews()
         self._message_views.add_search_requested.connect(self._open_search_dialog)
-        self._message_views.run_saved_search_requested.connect(self._run_search)
+        self._message_views.edit_search_requested.connect(self._open_edit_search_dialog)
+        self._message_views.run_saved_search_requested.connect(
+            lambda criteria: self._run_search(criteria, notify=True)
+        )
+        self._message_views.search_selected.connect(
+            lambda criteria: self._run_search(criteria, notify=False)
+        )
         self._message_views.export_rsmf_requested.connect(self._open_export_rsmf_dialog)
-        self._message_views.export_thread_rsmf_requested.connect(self._open_export_thread_dialog)
+        self._message_views.export_threads_rsmf_requested.connect(self._open_export_threads_dialog)
         self._message_views.full_table_tab_loaded.connect(self._on_full_table_tab_loaded)
         msg_panel_layout.addWidget(self._message_views)
         self._stack.addWidget(self._message_panel)
@@ -448,9 +459,18 @@ class MainWindow(QMainWindow):
         loading_layout.addWidget(self._loading_bar, 0, Qt.AlignmentFlag.AlignCenter)
         self._stack.addWidget(self._loading_overlay)
         right_layout.addWidget(self._stack)
-        splitter.addWidget(right)
-        splitter.setSizes([250, 900])
-        layout.addWidget(splitter)
+        self._main_splitter.addWidget(right)
+        self._main_splitter.setSizes([320, 880])
+        self._main_splitter.setHandleWidth(0)
+        self._main_splitter.setCollapsible(0, True)
+        self._main_splitter.setCollapsible(1, False)
+        if self._main_splitter.count() >= 2:
+            self._main_splitter.handle(0).setEnabled(False)
+        layout.addWidget(self._main_splitter)
+
+        self._cases_panel_expanded = True
+        self._cases_panel_width = 320
+        self._sync_cases_panel_toggle()
 
         self._rebuild_tree()
         self._current_case_id: Optional[str] = None
@@ -502,6 +522,44 @@ class MainWindow(QMainWindow):
         outer.addWidget(subtitle)
 
         return w
+
+    def _cases_panel_toggle_icon(self, expanded: bool) -> QIcon:
+        pixmap = (
+            QStyle.StandardPixmap.SP_ArrowLeft if expanded else QStyle.StandardPixmap.SP_ArrowRight
+        )
+        return self.style().standardIcon(pixmap)
+
+    def _sync_cases_panel_toggle(self) -> None:
+        expanded = self._cases_panel_expanded
+        self._toggle_cases_btn.setIcon(self._cases_panel_toggle_icon(expanded))
+        self._toggle_cases_btn.setToolTip(
+            "Hide cases panel" if expanded else "Show cases panel"
+        )
+
+    def _toggle_cases_panel(self) -> None:
+        self._set_cases_panel_expanded(not self._cases_panel_expanded)
+
+    def _set_cases_panel_expanded(self, expanded: bool) -> None:
+        self._cases_panel_expanded = expanded
+        self._cases_heading.setVisible(expanded)
+        self._add_case_btn.setVisible(expanded)
+        self._tree.setVisible(expanded)
+        self._sync_cases_panel_toggle()
+
+        sizes = self._main_splitter.sizes()
+        total = max(sum(sizes), 1)
+        if expanded:
+            self._tree_container.setMinimumWidth(280)
+            self._tree_container.setMaximumWidth(16777215)
+            width = max(self._cases_panel_width, 280)
+            self._main_splitter.setSizes([width, max(100, total - width)])
+        else:
+            if sizes[0] > 60:
+                self._cases_panel_width = sizes[0]
+            self._tree_container.setMinimumWidth(0)
+            self._tree_container.setMaximumWidth(48)
+            collapsed_width = 40
+            self._main_splitter.setSizes([collapsed_width, max(100, total - collapsed_width)])
 
     def _refresh_file_menu_backup_actions(self) -> None:
         has_backup = bool(self._current_case_id and self._current_backup_id)
@@ -584,12 +642,26 @@ class MainWindow(QMainWindow):
             case_item.setExpanded(False)
             self._update_case_item_icon(case_item)
 
-    def _on_tree_empty_click(self) -> None:
-        """Called when user clicks empty space in tree; show placeholder."""
-        self._load_backup_timer.stop()
-        self._pending_backup_item = None
-        self._stack.setCurrentWidget(self._placeholder)
-        self._refresh_file_menu_backup_actions()
+    def _find_backup_tree_item(self, case_id: str, backup_id: str) -> Optional[QTreeWidgetItem]:
+        for i in range(self._tree.topLevelItemCount()):
+            case_item = self._tree.topLevelItem(i)
+            if self._item_to_case_id.get(id(case_item)) != case_id:
+                continue
+            for j in range(case_item.childCount()):
+                back_item = case_item.child(j)
+                if self._item_to_backup_id.get(id(back_item)) == backup_id:
+                    return back_item
+        return None
+
+    def _restore_backup_tree_selection(self) -> None:
+        if not self._current_case_id or not self._current_backup_id:
+            return
+        item = self._find_backup_tree_item(self._current_case_id, self._current_backup_id)
+        if item is None:
+            return
+        self._tree.blockSignals(True)
+        self._tree.setCurrentItem(item)
+        self._tree.blockSignals(False)
 
     def _on_tree_context_menu(self, position) -> None:
         self._load_backup_timer.stop()
@@ -652,17 +724,29 @@ class MainWindow(QMainWindow):
     def _on_tree_selection_changed(self) -> None:
         item = self._tree.currentItem()
         if not item:
+            if self._current_case_id and self._current_backup_id:
+                self._restore_backup_tree_selection()
             return
         backup_id = self._item_to_backup_id.get(id(item))
         if backup_id:
+            case_id = self._item_to_case_id.get(id(item))
+            if (
+                case_id == self._current_case_id
+                and backup_id == self._current_backup_id
+                and self._stack.currentWidget() == self._message_panel
+            ):
+                return
             self._pending_backup_item = item
             self._show_loading_overlay()
             self._load_backup_timer.start(150)
-        else:
-            self._pending_backup_item = None
-            self._load_backup_timer.stop()
-            self._stack.setCurrentWidget(self._placeholder)
-            self._refresh_file_menu_backup_actions()
+            return
+        if self._current_case_id and self._current_backup_id:
+            self._restore_backup_tree_selection()
+            return
+        self._pending_backup_item = None
+        self._load_backup_timer.stop()
+        self._stack.setCurrentWidget(self._placeholder)
+        self._refresh_file_menu_backup_actions()
 
     def _on_load_backup_timer(self) -> None:
         if self._pending_backup_item is not None:
@@ -947,8 +1031,41 @@ class MainWindow(QMainWindow):
             self,
             default_folder_id=default_folder_id,
             library_display_name=lib_name,
+            chats=self._message_views.get_chats_for_search_picker(),
         )
-        dlg.run_search_requested.connect(self._run_search)
+        dlg.run_search_requested.connect(
+            lambda criteria: self._run_search(criteria, notify=True)
+        )
+        dlg.exec()
+        self._message_views.refresh_saved_searches_list()
+
+    def _open_edit_search_dialog(self, search_id: str) -> None:
+        if not self._current_backup_id:
+            QMessageBox.warning(self, "Search", "Load a backup first by selecting it in the tree.")
+            return
+        if not self._current_case_id:
+            QMessageBox.warning(self, "Search", "No case context for saved searches. Select a backup in the tree.")
+            return
+        from app.saved_searches import load_saved_searches
+
+        searches = load_saved_searches(self._app_data_root, self._current_case_id)
+        saved = next((s for s in searches if s.get("id") == search_id), None)
+        if saved is None:
+            QMessageBox.warning(self, "Edit Search", "This saved search could not be found.")
+            self._message_views.refresh_saved_searches_list()
+            return
+        lib_name = (self._cases.get(self._current_case_id) or "").strip() or None
+        dlg = SearchDialog(
+            self._app_data_root,
+            self._current_case_id,
+            self,
+            library_display_name=lib_name,
+            edit_search=saved,
+            chats=self._message_views.get_chats_for_search_picker(),
+        )
+        dlg.run_search_requested.connect(
+            lambda criteria: self._run_search(criteria, notify=True)
+        )
         dlg.exec()
         self._message_views.refresh_saved_searches_list()
 
@@ -1036,15 +1153,29 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export RSMF", "Run a search first to get results to export.")
             return
         all_messages = self._message_views.get_all_messages()
-        to_export = expand_results_to_full_threads(
+        chunk_24h = self._message_views.get_current_search_chunk_24h()
+        to_export = expand_results_for_rsmf_export(
             results,
             all_messages or [],
             timezone_name=self._current_timezone or "",
+            chunk_24h=chunk_24h,
         )
         attach_base = cache.get_backup_cache_root(self._app_data_root, self._current_case_id, self._current_backup_id)
-        backup_path, passphrase, cancelled = self._resolve_backup_fallback(to_export, attach_base)
+        # Match thread export: decide backup fallback from full chats in the search,
+        # not only the expanded hit subset, so uncached attachments still resolve.
+        chat_ids = {m.get("chat_id") for m in results if m.get("chat_id") is not None}
+        fallback_scope = to_export
+        if chat_ids:
+            fallback_scope = [
+                m for m in (all_messages or []) if m.get("chat_id") in chat_ids
+            ]
+        backup_path, passphrase, cancelled = self._resolve_backup_fallback(fallback_scope, attach_base)
         if cancelled:
             return
+        from datetime import datetime
+        chat_id_to_label = self._message_views.get_chat_id_to_label()
+        search_name = (self._message_views.get_current_search_name() or "search").replace(" ", "_")
+        zip_name = f"search_{search_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         dlg = ExportRsmfDialog(
             to_export,
             attach_base,
@@ -1052,35 +1183,56 @@ class MainWindow(QMainWindow):
             parent=self,
             backup_path=backup_path,
             passphrase=passphrase,
+            chat_id_to_label=chat_id_to_label,
+            zip_name=zip_name,
         )
         dlg.exec()
 
-    def _open_export_thread_dialog(self, chat_rowid: int) -> None:
+    def _open_export_threads_dialog(self, chat_rowids: list) -> None:
         if not self._current_backup_id:
-            QMessageBox.warning(self, "Export thread", "Load a backup first.")
+            QMessageBox.warning(self, "Export threads", "Load a backup first.")
             return
-        chat_msgs = self._message_views.get_messages_for_chat(int(chat_rowid))
-        if not chat_msgs:
-            QMessageBox.warning(self, "Export thread", "Select a thread with messages first.")
+        if not chat_rowids:
             return
+
+        chat_by_id = {ch.get("rowid"): ch for ch in self._message_views.get_chats_for_search_picker()}
+        threads = []
+        fallback_scope: List[dict] = []
+        for rowid in chat_rowids:
+            cid = int(rowid)
+            ch = chat_by_id.get(cid)
+            label = (ch.get("label") if ch else None) or f"Chat {cid}"
+            msgs = self._message_views.get_messages_for_chat(cid)
+            if not msgs:
+                continue
+            threads.append({"label": label, "messages": msgs})
+            fallback_scope.extend(msgs)
+
+        if not threads:
+            QMessageBox.warning(self, "Export threads", "Selected threads have no messages.")
+            return
+
+        preview = ThreadExportPreviewDialog(threads, parent=self)
+        if preview.exec() != QDialog.DialogCode.Accepted:
+            return
+
         attach_base = cache.get_backup_cache_root(
             self._app_data_root, self._current_case_id, self._current_backup_id
         )
-        backup_path, passphrase, cancelled = self._resolve_backup_fallback(chat_msgs, attach_base)
+        backup_path, passphrase, cancelled = self._resolve_backup_fallback(fallback_scope, attach_base)
         if cancelled:
             return
         ThreadExportDialog(
-            chat_messages=chat_msgs,
+            threads=threads,
             attachment_base=attach_base,
             custodian=self._current_custodian,
             timezone_name=self._current_timezone or "",
-            chat_label=self._message_views.get_current_chat_label(),
             parent=self,
             backup_path=backup_path,
             passphrase=passphrase,
         ).exec()
 
-    def _run_search(self, criteria: Dict[str, Any]) -> None:
+    def _run_search(self, criteria: Dict[str, Any], *, notify: bool = True) -> None:
         messages = self._message_views.get_all_messages()
         if not messages:
             QMessageBox.warning(self, "Search", "No messages in the current backup.")
@@ -1097,13 +1249,20 @@ class MainWindow(QMainWindow):
             timezone_name=self._current_timezone,
             search_name=criteria.get("search_name", "Search results"),
             search_sequence=criteria.get("sequence", 0),
+            thread_ids=criteria.get("thread_ids") or [],
         )
-        self._message_views.set_search_results(results, criteria.get("search_id"))
-        QMessageBox.information(
-            self,
-            "Search",
-            f"Found {len(results)} message(s). Results are shown on the Search Messages tab.",
+        self._message_views.set_search_results(
+            results,
+            criteria.get("search_id"),
+            chunk_24h=bool(criteria.get("chunk_24h", False)),
+            search_name=criteria.get("search_name", ""),
         )
+        if notify:
+            QMessageBox.information(
+                self,
+                "Search",
+                f"Found {len(results)} message(s). Results are shown on the Search Messages tab.",
+            )
 
     def _delete_current_backup(self) -> None:
         if not self._current_case_id or not self._current_backup_id:
@@ -1267,87 +1426,17 @@ class MainWindow(QMainWindow):
     def _on_help(self) -> None:
         dlg = QDialog(self)
         dlg.setWindowTitle("GURU Mobile Discovery — Help")
-        dlg.resize(720, 600)
+        dlg.setModal(True)
         layout = QVBoxLayout(dlg)
-        browser = QTextBrowser()
-        browser.setOpenExternalLinks(True)
-        browser.setHtml(self._help_html())
-        layout.addWidget(browser)
+        layout.setContentsMargins(32, 28, 32, 20)
+        label = QLabel("Coming soon")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(dlg.reject)
         buttons.accepted.connect(dlg.accept)
         layout.addWidget(buttons)
         dlg.exec()
-
-    def _help_html(self) -> str:
-        return """
-        <h2>GURU Mobile Discovery — User Guide</h2>
-        <p>GURU Mobile Discovery organizes mobile-device backups by case for forensic and legal review.
-        Each case can hold one or more imported backups; messages are pre-cached so that switching
-        between conversations and table views is instant. iPhone (iTunes) backups are supported today;
-        Android backups are planned.</p>
-
-        <h3>Cases</h3>
-        <ul>
-          <li><b>Add a case</b> — click <i>New Case</i> at the top of the case list (or use File &rarr; New Case) and enter a name.</li>
-          <li><b>Rename</b> — double-click a case name in the tree, edit, and press Enter.</li>
-          <li><b>Delete a case</b> — right-click the case &rarr; <i>Delete case</i>. This removes the
-          case and <b>all cached data for every backup inside it</b>.</li>
-        </ul>
-
-        <h3>Importing an iTunes backup</h3>
-        <ol>
-          <li>Right-click the case you want to import into &rarr; <i>Import iTunes backup…</i></li>
-          <li>In the dialog:
-            <ul>
-              <li><b>Backup folder</b> — browse to the iTunes backup root (the folder that contains
-              <code>Manifest.db</code> / <code>Manifest.plist</code>).</li>
-              <li><b>Custodian</b> — name shown in messages in place of the device owner
-              (e.g. "John Smith" rather than "Me").</li>
-              <li><b>Time zone</b> — defaults to the backup's recorded time zone when available;
-              change to control how timestamps are displayed.</li>
-              <li><b>Password</b> — required only for encrypted backups. The password is stored
-              with the backup so you don't need to re-enter it.</li>
-            </ul>
-          </li>
-          <li>Click <i>Import</i>. A progress bar shows backup parsing, message extraction, and
-          caching. The backup appears under the case when complete.</li>
-        </ol>
-
-        <h3>Viewing messages</h3>
-        <p>Click a backup under a case to load it. The right pane shows two tabs:</p>
-        <ul>
-          <li><b>Thread view</b> — full conversations with inline images, emojis, and stills for GIFs.
-          Use the conversation list on the left of the tab to jump between chats.</li>
-          <li><b>Table view</b> — every message in a sortable grid (Date, Direction, From/To, Body,
-          Hash, Sender ID, Chat). Useful for filtering, sorting, and exporting evidence.</li>
-        </ul>
-        <p>Switching between tabs is instant once the backup is loaded; the loading bar at the top of the
-        right pane shows progress whenever a backup is being read from the cache.</p>
-
-        <h3>Search</h3>
-        <p>Use the search box / search action on the message panel to find messages across all chats in
-        the current backup. Results expand to full threads so context is preserved.</p>
-
-        <h3>File menu</h3>
-        <ul>
-          <li><b>Extract Attachments…</b> — copies attachment files (images, videos, etc.) from the
-          original backup into the case cache, so they can render inline in the thread view.</li>
-          <li><b>Populate Table View…</b> — builds the full message grid for the Table View tab.
-          Useful if Table View was skipped during import to speed up that import.</li>
-        </ul>
-
-        <h3>Deleting a backup</h3>
-        <p>Right-click a backup &rarr; <i>Delete backup</i>. This removes the cached messages and
-        attachments for that backup but leaves the case in place.</p>
-
-        <h3>Where data is stored</h3>
-        <p>By default, all cases, cached messages, and attachments live under
-        <code>%LOCALAPPDATA%\\GURU Mobile Discovery\\</code> on Windows (existing installs may still
-        use <code>iTunes Parser v2</code> until you migrate the folder). To override the location, set
-        the <code>GURU_MOBILE_DISCOVERY_DATA</code> environment variable to an absolute path before launching
-        the program (the legacy name <code>ITUNES_PARSER_V2_DATA</code> is still accepted).</p>
-        """
 
     def _on_about(self) -> None:
         dlg = QDialog(self)

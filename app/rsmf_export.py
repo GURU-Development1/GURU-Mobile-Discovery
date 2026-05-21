@@ -16,7 +16,12 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypedDict
+
+
+class ThreadExportSpec(TypedDict):
+    label: str
+    messages: List[dict]
 
 
 
@@ -533,8 +538,40 @@ def _sanitize_zip_member_name(name: str, used: set) -> str:
     return candidate
 
 
-def export_search_results_to_rsmf(
+def _unique_folder_name(label: str, used: set) -> str:
+    """Make a thread folder name unique inside the output ZIP."""
+    base = _sanitize_filename(label)
+    if base not in used:
+        used.add(base)
+        return base
+    i = 2
+    while f"{base}_{i}" in used:
+        i += 1
+    candidate = f"{base}_{i}"
+    used.add(candidate)
+    return candidate
+
+
+def group_messages_by_thread(
     messages: List[dict],
+    chat_id_to_label: Dict[int, str],
+) -> List[ThreadExportSpec]:
+    """Partition messages by chat_id for per-thread export folders."""
+    groups: Dict[int, List[dict]] = {}
+    for m in messages:
+        cid = m.get("chat_id")
+        if cid is None:
+            continue
+        groups.setdefault(int(cid), []).append(m)
+    threads: List[ThreadExportSpec] = []
+    for cid in sorted(groups.keys(), key=lambda k: (chat_id_to_label.get(k) or "").lower()):
+        label = chat_id_to_label.get(cid) or f"Chat_{cid}"
+        threads.append({"label": label, "messages": groups[cid]})
+    return threads
+
+
+def export_threads_bundle_to_rsmf(
+    threads: List[ThreadExportSpec],
     attachment_base: Optional[Path],
     output_dir: Path,
     custodian: str = "",
@@ -547,17 +584,17 @@ def export_search_results_to_rsmf(
     attachment_resolver: Optional[Callable[[dict], Optional[tuple]]] = None,
 ) -> List[Path]:
     """
-    Group messages by conversation_id and bundle all .rsmf files into a single
-    ZIP archive inside output_dir. Returns [zip_path] on success, [] on failure.
-
-    The ZIP filename is `zip_name` (sanitized, .zip extension auto-appended) if
-    provided, otherwise `rsmf_export_<YYYYMMDD_HHMMSS>.zip`.
+    Export one or more threads into a single ZIP where each thread gets its own
+    folder containing one .rsmf file per conversation_id within that thread.
     """
-    if progress_cb:
-        progress_cb(0, f"Grouping {len(messages)} messages by conversation...")
-    cid_to_msgs = _group_by_conversation_id(messages)
-    total = len(cid_to_msgs)
-    if not total:
+    non_empty = [t for t in threads if t.get("messages")]
+    if not non_empty:
+        return []
+
+    total_rsmfs = 0
+    for t in non_empty:
+        total_rsmfs += len(_group_by_conversation_id(t["messages"]))
+    if not total_rsmfs:
         return []
 
     if zip_name:
@@ -569,54 +606,101 @@ def export_search_results_to_rsmf(
     zip_path = output_dir / f"{zip_stem}.zip"
 
     if progress_cb:
-        progress_cb(0, f"Bundling {total} conversation(s) into {zip_path.name}...")
+        progress_cb(
+            0,
+            f"Bundling {len(non_empty)} thread(s), {total_rsmfs} conversation(s) into {zip_path.name}...",
+        )
 
-    used_names: set = set()
+    used_folders: set = set()
+    used_members: set = set()
+    done = 0
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            done = 0
-            for cid, msgs in cid_to_msgs.items():
-                msgs_sorted = sorted(
-                    msgs,
-                    key=lambda x: (
-                        float(x.get("date_timestamp") or x.get("date") or 0),
-                        x.get("rowid") or 0,
-                    ),
-                )
-                att_count = sum(len(m.get("attachments") or []) for m in msgs_sorted)
-                short_id = (cid[:40] + "...") if len(cid) > 40 else cid
-                current = done + 1
-                if progress_cb:
-                    progress_cb(
-                        100 * done / total,
-                        f"Building RSMF {current}/{total}: {short_id} "
-                        f"({len(msgs_sorted)} messages, {att_count} attachments)",
+            for thread in non_empty:
+                label = thread.get("label") or "thread"
+                folder = _unique_folder_name(label, used_folders)
+                cid_to_msgs = _group_by_conversation_id(thread["messages"])
+                for cid, msgs in cid_to_msgs.items():
+                    msgs_sorted = sorted(
+                        msgs,
+                        key=lambda x: (
+                            float(x.get("date_timestamp") or x.get("date") or 0),
+                            x.get("rowid") or 0,
+                        ),
                     )
-                body = _build_rsmf_bytes(
-                    cid,
-                    msgs_sorted,
-                    attachment_base,
-                    custodian=custodian,
-                    rsmf_version=rsmf_version,
-                    include_control_number=include_control_number,
-                    include_is_deleted=include_is_deleted,
-                    include_attachments=include_attachments,
-                    attachment_resolver=attachment_resolver,
-                )
-                if body is None:
+                    att_count = sum(len(m.get("attachments") or []) for m in msgs_sorted)
+                    short_id = (cid[:40] + "...") if len(cid) > 40 else cid
+                    if progress_cb:
+                        progress_cb(
+                            100 * done / total_rsmfs,
+                            f"Building RSMF {done + 1}/{total_rsmfs} ({folder}): {short_id} "
+                            f"({len(msgs_sorted)} messages, {att_count} attachments)",
+                        )
+                    body = _build_rsmf_bytes(
+                        cid,
+                        msgs_sorted,
+                        attachment_base,
+                        custodian=custodian,
+                        rsmf_version=rsmf_version,
+                        include_control_number=include_control_number,
+                        include_is_deleted=include_is_deleted,
+                        include_attachments=include_attachments,
+                        attachment_resolver=attachment_resolver,
+                    )
                     done += 1
-                    continue
-                member_name = _sanitize_zip_member_name(cid, used_names)
-                zf.writestr(member_name, body)
-                done += 1
-                if progress_cb:
-                    progress_cb(
-                        100 * done / total,
-                        f"Added {member_name} ({done}/{total})",
-                    )
+                    if body is None:
+                        continue
+                    member_name = f"{folder}/{_sanitize_zip_member_name(cid, used_members)}"
+                    zf.writestr(member_name, body)
+                    if progress_cb:
+                        progress_cb(
+                            100 * done / total_rsmfs,
+                            f"Added {member_name} ({done}/{total_rsmfs})",
+                        )
     except OSError:
         return []
 
     if progress_cb:
-        progress_cb(100, f"Wrote {zip_path.name} ({total} conversation(s))")
+        progress_cb(100, f"Wrote {zip_path.name} ({len(non_empty)} thread(s))")
     return [zip_path]
+
+
+def export_search_results_to_rsmf(
+    messages: List[dict],
+    attachment_base: Optional[Path],
+    output_dir: Path,
+    custodian: str = "",
+    rsmf_version: str = "1.0.0",
+    include_control_number: bool = True,
+    include_is_deleted: bool = True,
+    include_attachments: bool = True,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    zip_name: Optional[str] = None,
+    attachment_resolver: Optional[Callable[[dict], Optional[tuple]]] = None,
+    chat_id_to_label: Optional[Dict[int, str]] = None,
+) -> List[Path]:
+    """
+    Bundle search/thread export results into a single ZIP archive inside output_dir.
+    Messages are grouped by chat_id into per-thread folders; each folder contains
+    one .rsmf file per conversation_id. Returns [zip_path] on success, [] on failure.
+    """
+    if progress_cb:
+        progress_cb(0, f"Grouping {len(messages)} messages by thread...")
+    label_map = chat_id_to_label or {}
+    threads = group_messages_by_thread(messages, label_map)
+    if not threads:
+        single_label = "export"
+        threads = [{"label": single_label, "messages": list(messages)}]
+    return export_threads_bundle_to_rsmf(
+        threads,
+        attachment_base,
+        output_dir,
+        custodian=custodian,
+        rsmf_version=rsmf_version,
+        include_control_number=include_control_number,
+        include_is_deleted=include_is_deleted,
+        include_attachments=include_attachments,
+        progress_cb=progress_cb,
+        zip_name=zip_name,
+        attachment_resolver=attachment_resolver,
+    )

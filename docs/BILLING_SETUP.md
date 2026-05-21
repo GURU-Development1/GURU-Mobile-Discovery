@@ -1,4 +1,4 @@
-# Stripe + Keygen + Resend billing setup (full walkthrough)
+# Lemon Squeezy + Keygen + Resend billing setup (full walkthrough)
 
 Use this guide when you are ready to wire payments to license keys. The Cloudflare Worker lives under [`server/billing/`](../server/billing/). For quick commands and env vars, see [`server/billing/README.md`](../server/billing/README.md).
 
@@ -10,7 +10,7 @@ Set these up before anything else:
 
 | Item | Notes |
 |------|--------|
-| **Stripe** | [dashboard.stripe.com](https://dashboard.stripe.com/register). Use **test mode** until you go live. |
+| **Lemon Squeezy** | [lemonsqueezy.com](https://www.lemonsqueezy.com). Create a store and subscription product. |
 | **Keygen** | Account + product + policy (`maxMachines: 1`, license auth). IDs may already be in [`app/license_config.py`](../app/license_config.py). |
 | **Resend** | [resend.com](https://resend.com). Verify a sending domain (production) or use sandbox `onboarding@resend.dev` for early tests. |
 | **Cloudflare** | Free Workers account at [dash.cloudflare.com](https://dash.cloudflare.com/sign-up). |
@@ -18,30 +18,23 @@ Set these up before anything else:
 **Install locally:**
 
 - **Node.js 20+** (LTS): [nodejs.org](https://nodejs.org)
-- **Stripe CLI** (Windows): `winget install Stripe.StripeCLI`
 
 ---
 
-## Stage 1 — Stripe dashboard (test mode)
+## Stage 1 — Lemon Squeezy dashboard
 
-1. **Toggle test mode** (top-right of Stripe Dashboard).
+1. **Create a store** (if you have not already).
 
 2. **Create the product**
-   - **Product catalog → Add product**
    - Name: `GURU Mobile Discovery`
-   - Pricing: **Recurring**, **Yearly**, set amount → Save
+   - Pricing: **Subscription**, **Yearly** (or your preferred billing interval)
+   - Save and note the **Store ID** and **Variant ID**
 
-3. **Create a Payment Link**
-   - **Product catalog → Payment links → New**
-   - Select that yearly price
-   - Options: after payment, show a confirmation message (e.g. “Your license key has been emailed.”)
-   - Save and copy the URL (`https://buy.stripe.com/test_...`)
+3. **Copy the checkout URL**
+   - From the product share/checkout link, e.g. `https://yourstore.lemonsqueezy.com/checkout/buy/...`
+   - You will paste this into [`app/license_config.py`](../app/license_config.py) as `_DEFAULT_LEMON_SQUEEZY_CHECKOUT_URL` (or set env var `GURU_LEMON_SQUEEZY_CHECKOUT_URL` at build/runtime)
 
-4. **Customer portal**
-   - **Settings → Billing → Customer portal**
-   - Activate test link; allow cancel subscription and payment method updates.
-
-5. **Webhook:** Do **not** add it yet — you need the Worker URL from Stage 4 first.
+4. **Webhook:** Do **not** add it yet — you need the Worker URL from Stage 4 first.
 
 ---
 
@@ -78,7 +71,7 @@ npx wrangler login
 Set secrets (Wrangler prompts for each value):
 
 ```bash
-npx wrangler secret put STRIPE_SECRET_KEY
+npx wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET
 npx wrangler secret put KEYGEN_ACCOUNT_ID
 npx wrangler secret put KEYGEN_PRODUCT_ID
 npx wrangler secret put KEYGEN_POLICY_ID
@@ -87,7 +80,13 @@ npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put RESEND_FROM_EMAIL
 ```
 
-Skip `STRIPE_WEBHOOK_SECRET` until Stage 5.
+Optional (recommended in production):
+
+```bash
+npx wrangler secret put LEMON_SQUEEZY_STORE_ID
+```
+
+Skip `LEMON_SQUEEZY_WEBHOOK_SECRET` until Stage 5 if you prefer to deploy the Worker first.
 
 Deploy:
 
@@ -101,31 +100,33 @@ Sanity: open `https://<worker-host>/healthz` → should return `ok`.
 
 ---
 
-## Stage 5 — Stripe webhook
+## Stage 5 — Lemon Squeezy webhook
 
-1. Stripe → **Developers → Webhooks → Add endpoint**
+1. Lemon Squeezy → **Settings → Webhooks → Create webhook**
 
-2. **URL:** `https://<worker-host>/stripe/webhook`
+2. **URL:** `https://<worker-host>/lemonsqueezy/webhook`
 
-3. **Events** (subscribe to these):
+3. **Signing secret** — choose a secret (6–40 characters); save it for the Worker.
 
-   - `checkout.session.completed`
-   - `customer.subscription.updated`
-   - `customer.subscription.deleted`
-   - `invoice.payment_succeeded`
-   - `invoice.payment_failed`
-   - `charge.refunded`
-   - `charge.dispute.created`
+4. **Events** (subscribe to these):
 
-4. Save → **Reveal signing secret** (`whsec_...`)
+   - `subscription_created`
+   - `subscription_updated`
+   - `subscription_cancelled`
+   - `subscription_expired`
+   - `subscription_resumed`
+   - `subscription_unpaused`
+   - `subscription_payment_success`
+   - `subscription_payment_failed`
+   - `subscription_payment_refunded`
 
 5. Back in `server/billing`:
 
 ```bash
-npx wrangler secret put STRIPE_WEBHOOK_SECRET
+npx wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET
 ```
 
-Paste `whsec_...`, then redeploy:
+Paste the signing secret, then redeploy:
 
 ```bash
 npm run deploy
@@ -135,15 +136,17 @@ npm run deploy
 
 ## Stage 6 — Desktop app “Buy” link
 
-In [`app/license_config.py`](../app/license_config.py), set `_DEFAULT_BUY_URL` to your **test** Payment Link URL (from Stage 1), or set env var `GURU_BUY_URL` at runtime. When empty, the license dialog hides the buy link.
+In [`app/license_config.py`](../app/license_config.py), set `_DEFAULT_LEMON_SQUEEZY_CHECKOUT_URL` to your Lemon Squeezy checkout URL, or set env var `GURU_LEMON_SQUEEZY_CHECKOUT_URL` at runtime.
+
+When the checkout URL is **empty**, the license dialog still shows **Buy one**, but clicking it opens a **Coming soon** message. Set the URL when you are ready to accept purchases.
 
 ---
 
 ## Stage 7 — End-to-end test
 
-1. Run the app → activation dialog → **Buy one** (if URL set).
+1. Run the app → activation dialog → **Buy one** (opens checkout when URL is set).
 
-2. Complete checkout with test card `4242 4242 4242 4242`, future expiry, any CVC. Use an email that can receive mail.
+2. Complete checkout with Lemon Squeezy test mode. Use an email that can receive mail.
 
 3. Tail Worker logs:
 
@@ -152,7 +155,7 @@ cd server/billing
 npm run tail
 ```
 
-   Expect `POST .../stripe/webhook` → 200.
+   Expect `POST .../lemonsqueezy/webhook` → 200.
 
 4. Check email for the license key → paste into **Activate** in the app.
 
@@ -160,7 +163,7 @@ npm run tail
 
 ## Stage 8 — Verify cancellation
 
-1. Stripe (test) → **Customers** → test customer → cancel subscription (immediately).
+1. Lemon Squeezy → cancel the test subscription.
 
 2. Relaunch the app — license should fail validation / prompt again if suspended.
 
@@ -168,19 +171,19 @@ npm run tail
 
 ## Stage 9 — Going live
 
-1. Stripe: switch to **Live mode**; recreate product, price, Payment Link, Customer Portal, and a **new** webhook endpoint pointing at your **production** Worker URL.
+1. Lemon Squeezy: switch to **Live mode**; recreate or enable live checkout and register a webhook pointing at your **production** Worker URL.
 
 2. Resend: use a verified domain and production API key.
 
 3. Worker secrets for production (example):
 
 ```bash
-npx wrangler secret put STRIPE_SECRET_KEY --env production
+npx wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET --env production
 # ... repeat each secret with --env production
 npm run deploy:prod
 ```
 
-4. Update `_DEFAULT_BUY_URL` (or build-time env) to the **live** Payment Link before shipping the installer.
+4. Update `_DEFAULT_LEMON_SQUEEZY_CHECKOUT_URL` (or build-time env) to the **live** checkout URL before shipping the installer.
 
 ---
 
@@ -192,13 +195,20 @@ From `server/billing`:
 npm run dev
 ```
 
-Stripe CLI forwards webhooks to localhost:
+Put secrets in `server/billing/.dev.vars` (gitignored). Example `.dev.vars`:
 
-```bash
-stripe listen --forward-to localhost:8787/stripe/webhook
+```
+LEMON_SQUEEZY_WEBHOOK_SECRET=your-signing-secret
+LEMON_SQUEEZY_STORE_ID=12345
+KEYGEN_ACCOUNT_ID=...
+KEYGEN_PRODUCT_ID=...
+KEYGEN_POLICY_ID=...
+KEYGEN_ADMIN_TOKEN=...
+RESEND_API_KEY=re_...
+RESEND_FROM_EMAIL=licenses@example.com
 ```
 
-Put secrets in `server/billing/.dev.vars` (gitignored); see [`server/billing/README.md`](../server/billing/README.md).
+Use a tunnel (e.g. ngrok, Cloudflare Tunnel) to forward Lemon Squeezy webhooks to `http://localhost:8787/lemonsqueezy/webhook` for local testing.
 
 ---
 
@@ -206,11 +216,11 @@ Put secrets in `server/billing/.dev.vars` (gitignored); see [`server/billing/REA
 
 | Symptom | Likely cause |
 |---------|----------------|
-| Webhook `400` / signature failed | Wrong `whsec_...` for that endpoint or test vs live mismatch |
+| Webhook `400` / signature failed | Wrong signing secret for that webhook endpoint |
 | No email | Resend sandbox / unverified domain / recipient not allowed |
 | Keygen `401` | Bad admin token or missing scopes |
 | App activates but later breaks | Policy mismatch (product scope, machine limit, license auth) |
-| “Buy one” missing | `BUY_URL` / `_DEFAULT_BUY_URL` empty |
+| “Buy one” shows Coming soon | `LEMON_SQUEEZY_CHECKOUT_URL` / `_DEFAULT_LEMON_SQUEEZY_CHECKOUT_URL` empty |
 
 ---
 
@@ -218,7 +228,7 @@ Put secrets in `server/billing/.dev.vars` (gitignored); see [`server/billing/REA
 
 | File | Purpose |
 |------|---------|
-| [`server/billing/`](../server/billing/) | Worker source (`stripe.ts`, `keygen.ts`, `email.ts`) |
+| [`server/billing/`](../server/billing/) | Worker source (`lemon_squeezy.ts`, `keygen.ts`, `email.ts`) |
 | [`server/billing/README.md`](../server/billing/README.md) | Commands, secrets list, local `.dev.vars` |
-| [`app/license_config.py`](../app/license_config.py) | Keygen public IDs + `BUY_URL` / `_DEFAULT_BUY_URL` |
-| [`app/license_dialog.py`](../app/license_dialog.py) | Buy link opens `BUY_URL` in browser |
+| [`app/license_config.py`](../app/license_config.py) | Keygen public IDs + `LEMON_SQUEEZY_CHECKOUT_URL` |
+| [`app/license_dialog.py`](../app/license_dialog.py) | Buy link → checkout URL or Coming soon dialog |
