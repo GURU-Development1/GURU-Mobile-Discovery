@@ -1,7 +1,8 @@
 """
 Persist and load saved search definitions (name, criteria, chunk_24h) and folders.
-Stored per case as ``<app_data>/cases/<case_id>/saved_searches.json``.
-A legacy global ``<app_data>/saved_searches.json`` is copied into a case file on first access.
+Stored per backup as ``<app_data>/cases/<case_id>/<backup_id>/saved_searches.json``.
+On first access for a backup, seeds from ``cases/<case_id>/saved_searches.json`` if present,
+otherwise from legacy global ``<app_data>/saved_searches.json``.
 
 JSON schema:
 {
@@ -11,7 +12,7 @@ JSON schema:
 }
 
 Each saved search has a sequence number (0001, 0002, ...) for Conversation ID prefixing.
-Every case has exactly one persisted top-level library root folder; all other
+Every backup has exactly one persisted top-level library root folder; all other
 folders nest under it, and every saved search lives inside some folder.
 """
 
@@ -23,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from app.cache import get_case_cache_root
+from app.cache import get_backup_cache_root, get_case_cache_root
 
 # Stable id for the always-present library root folder. The all-zero/one pattern
 # guarantees no collision with `uuid.uuid4()` (which sets version and variant bits).
@@ -40,34 +41,40 @@ def is_library_root_folder_id(folder_id: Optional[str]) -> bool:
     return folder_id == LIBRARY_ROOT_FOLDER_ID
 
 
-def _saved_searches_file(case_root: Path) -> Path:
-    return case_root / "saved_searches.json"
+def _saved_searches_file(storage_root: Path) -> Path:
+    return storage_root / "saved_searches.json"
 
 
-def _migrate_legacy_global(app_data_root: Path, case_root: Path) -> None:
-    """Copy pre-per-case ``saved_searches.json`` from app root into this case once."""
-    dest = _saved_searches_file(case_root)
+def _migrate_to_backup_storage(app_data_root: Path, case_id: str, backup_id: str) -> Path:
+    """Ensure per-backup saved_searches.json exists, seeding from case-level or legacy global."""
+    backup_root = get_backup_cache_root(app_data_root, case_id, backup_id)
+    dest = _saved_searches_file(backup_root)
     if dest.exists():
-        return
+        return backup_root
+    backup_root.mkdir(parents=True, exist_ok=True)
+    case_seed = _saved_searches_file(get_case_cache_root(app_data_root, case_id))
+    if case_seed.is_file():
+        try:
+            shutil.copy2(case_seed, dest)
+            return backup_root
+        except OSError:
+            pass
     legacy = app_data_root / "saved_searches.json"
-    if not legacy.is_file():
-        return
-    try:
-        case_root.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(legacy, dest)
-    except OSError:
-        return
+    if legacy.is_file():
+        try:
+            shutil.copy2(legacy, dest)
+        except OSError:
+            pass
+    return backup_root
 
 
-def _case_saved_search_root(app_data_root: Path, case_id: str) -> Path:
-    case_root = get_case_cache_root(app_data_root, case_id)
-    _migrate_legacy_global(app_data_root, case_root)
-    return case_root
+def _backup_saved_search_root(app_data_root: Path, case_id: str, backup_id: str) -> Path:
+    return _migrate_to_backup_storage(app_data_root, case_id, backup_id)
 
 
-def _read_raw(case_root: Path) -> Dict[str, Any]:
+def _read_raw(storage_root: Path) -> Dict[str, Any]:
     """Read the whole JSON file (searches + folders). Returns empty dict on missing/corrupt."""
-    path = _saved_searches_file(case_root)
+    path = _saved_searches_file(storage_root)
     if not path.exists():
         return {}
     try:
@@ -79,8 +86,8 @@ def _read_raw(case_root: Path) -> Dict[str, Any]:
         return {}
 
 
-def _write_raw(case_root: Path, searches: List[Dict[str, Any]], folders: List[Dict[str, Any]]) -> None:
-    path = _saved_searches_file(case_root)
+def _write_raw(storage_root: Path, searches: List[Dict[str, Any]], folders: List[Dict[str, Any]]) -> None:
+    path = _saved_searches_file(storage_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps({"searches": searches, "folders": folders}, indent=2),
@@ -88,7 +95,7 @@ def _write_raw(case_root: Path, searches: List[Dict[str, Any]], folders: List[Di
     )
 
 
-def ensure_library_root(case_root: Path, library_display_name: Optional[str] = None) -> None:
+def ensure_library_root(storage_root: Path, library_display_name: Optional[str] = None) -> None:
     """Guarantee the library root folder exists and absorbs any orphan items.
 
     Idempotent. Reads raw data once, applies migrations, and writes back only
@@ -99,7 +106,7 @@ def ensure_library_root(case_root: Path, library_display_name: Optional[str] = N
     libraries and upgrades the legacy default label ``Saved searches``.
     """
     display = (library_display_name or "").strip()
-    data = _read_raw(case_root)
+    data = _read_raw(storage_root)
     raw_folders = data.get("folders") if isinstance(data, dict) else None
     raw_searches = data.get("searches") if isinstance(data, dict) else None
     folders: List[Dict[str, Any]] = [dict(f) for f in raw_folders] if isinstance(raw_folders, list) else []
@@ -147,23 +154,22 @@ def ensure_library_root(case_root: Path, library_display_name: Optional[str] = N
             changed = True
 
     if changed:
-        _write_raw(case_root, searches, folders)
+        _write_raw(storage_root, searches, folders)
 
 
 def load_saved_searches(
     app_data_root: Path,
     case_id: str,
+    backup_id: str,
     library_display_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Load list of saved searches. Each item: id, sequence, name, to_filter, body_filter, date_from, date_to, has_attachments, hash_filter, chunk_24h, folder_id. Legacy from_filter is ignored."""
-    case_root = _case_saved_search_root(app_data_root, case_id)
-    ensure_library_root(case_root, library_display_name=library_display_name)
-    data = _read_raw(case_root)
+    """Load list of saved searches for a backup."""
+    storage_root = _backup_saved_search_root(app_data_root, case_id, backup_id)
+    ensure_library_root(storage_root, library_display_name=library_display_name)
+    data = _read_raw(storage_root)
     items = data.get("searches", []) if isinstance(data, dict) else []
     folders = data.get("folders", []) if isinstance(data, dict) else []
     searches = [dict(s) for s in items]
-    # One-time migration: assign sequence only to searches that have none (legacy data).
-    # Never reassign by position — sequences are stable and never reused after deletion.
     modified = False
     next_seq = _next_sequence(searches)
     for s in searches:
@@ -173,7 +179,7 @@ def load_saved_searches(
             next_seq += 1
             modified = True
     if modified:
-        _write_raw(case_root, searches, [dict(f) for f in folders])
+        _write_raw(storage_root, searches, [dict(f) for f in folders])
     return searches
 
 
@@ -196,16 +202,22 @@ def _next_sequence(searches: List[Dict[str, Any]]) -> int:
     return max_seq + 1
 
 
-def save_saved_searches(app_data_root: Path, case_id: str, searches: List[Dict[str, Any]]) -> None:
+def save_saved_searches(
+    app_data_root: Path,
+    case_id: str,
+    backup_id: str,
+    searches: List[Dict[str, Any]],
+) -> None:
     """Overwrite saved searches list, preserving any existing folders on disk."""
-    folders = load_folders(app_data_root, case_id)
-    case_root = _case_saved_search_root(app_data_root, case_id)
-    _write_raw(case_root, searches, folders)
+    folders = load_folders(app_data_root, case_id, backup_id)
+    storage_root = _backup_saved_search_root(app_data_root, case_id, backup_id)
+    _write_raw(storage_root, searches, folders)
 
 
 def add_saved_search(
     app_data_root: Path,
     case_id: str,
+    backup_id: str,
     name: str,
     to_filter: str = "",
     body_filter: str = "",
@@ -218,7 +230,7 @@ def add_saved_search(
     folder_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Append a new saved search and return it (with id and sequence set)."""
-    searches = load_saved_searches(app_data_root, case_id)
+    searches = load_saved_searches(app_data_root, case_id, backup_id)
     search_id = str(uuid.uuid4())
     sequence = _next_sequence(searches)
     item = {
@@ -236,18 +248,19 @@ def add_saved_search(
         "folder_id": folder_id or LIBRARY_ROOT_FOLDER_ID,
     }
     searches.append(item)
-    save_saved_searches(app_data_root, case_id, searches)
+    save_saved_searches(app_data_root, case_id, backup_id, searches)
     return item
 
 
 def update_saved_search(
     app_data_root: Path,
     case_id: str,
+    backup_id: str,
     search_id: str,
     **kwargs: Any,
 ) -> Optional[Dict[str, Any]]:
     """Update a saved search by id. Returns updated item or None."""
-    searches = load_saved_searches(app_data_root, case_id)
+    searches = load_saved_searches(app_data_root, case_id, backup_id)
     for i, s in enumerate(searches):
         if s.get("id") == search_id:
             allowed = {
@@ -266,18 +279,23 @@ def update_saved_search(
             for k, v in kwargs.items():
                 if k in allowed:
                     searches[i][k] = v
-            save_saved_searches(app_data_root, case_id, searches)
+            save_saved_searches(app_data_root, case_id, backup_id, searches)
             return searches[i]
     return None
 
 
-def delete_saved_search(app_data_root: Path, case_id: str, search_id: str) -> bool:
+def delete_saved_search(
+    app_data_root: Path,
+    case_id: str,
+    backup_id: str,
+    search_id: str,
+) -> bool:
     """Remove a saved search by id. Returns True if removed."""
-    searches = load_saved_searches(app_data_root, case_id)
+    searches = load_saved_searches(app_data_root, case_id, backup_id)
     new_list = [s for s in searches if s.get("id") != search_id]
     if len(new_list) == len(searches):
         return False
-    save_saved_searches(app_data_root, case_id, new_list)
+    save_saved_searches(app_data_root, case_id, backup_id, new_list)
     return True
 
 
@@ -289,12 +307,13 @@ def delete_saved_search(app_data_root: Path, case_id: str, search_id: str) -> bo
 def load_folders(
     app_data_root: Path,
     case_id: str,
+    backup_id: str,
     library_display_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Load list of folders. Each item: id, name, parent_id (Optional[str])."""
-    case_root = _case_saved_search_root(app_data_root, case_id)
-    ensure_library_root(case_root, library_display_name=library_display_name)
-    data = _read_raw(case_root)
+    """Load list of folders for a backup. Each item: id, name, parent_id (Optional[str])."""
+    storage_root = _backup_saved_search_root(app_data_root, case_id, backup_id)
+    ensure_library_root(storage_root, library_display_name=library_display_name)
+    data = _read_raw(storage_root)
     items = data.get("folders", []) if isinstance(data, dict) else []
     folders: List[Dict[str, Any]] = []
     for f in items:
@@ -313,38 +332,61 @@ def load_folders(
     return folders
 
 
-def save_folders(app_data_root: Path, case_id: str, folders: List[Dict[str, Any]]) -> None:
+def save_folders(
+    app_data_root: Path,
+    case_id: str,
+    backup_id: str,
+    folders: List[Dict[str, Any]],
+) -> None:
     """Overwrite folders list, preserving any existing searches on disk."""
-    searches = load_saved_searches(app_data_root, case_id)
-    case_root = _case_saved_search_root(app_data_root, case_id)
-    _write_raw(case_root, searches, [dict(f) for f in folders])
+    searches = load_saved_searches(app_data_root, case_id, backup_id)
+    storage_root = _backup_saved_search_root(app_data_root, case_id, backup_id)
+    _write_raw(storage_root, searches, [dict(f) for f in folders])
 
 
-def add_folder(app_data_root: Path, case_id: str, name: str, parent_id: Optional[str] = None) -> Dict[str, Any]:
+def add_folder(
+    app_data_root: Path,
+    case_id: str,
+    backup_id: str,
+    name: str,
+    parent_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Append a new folder under the given parent (defaults to the library root)."""
-    folders = load_folders(app_data_root, case_id)
+    folders = load_folders(app_data_root, case_id, backup_id)
     folder = {
         "id": str(uuid.uuid4()),
         "name": (name or "New folder").strip() or "New folder",
         "parent_id": parent_id or LIBRARY_ROOT_FOLDER_ID,
     }
     folders.append(folder)
-    save_folders(app_data_root, case_id, folders)
+    save_folders(app_data_root, case_id, backup_id, folders)
     return folder
 
 
-def rename_folder(app_data_root: Path, case_id: str, folder_id: str, name: str) -> Optional[Dict[str, Any]]:
+def rename_folder(
+    app_data_root: Path,
+    case_id: str,
+    backup_id: str,
+    folder_id: str,
+    name: str,
+) -> Optional[Dict[str, Any]]:
     """Rename a folder by id. Returns the updated folder or None."""
-    folders = load_folders(app_data_root, case_id)
+    folders = load_folders(app_data_root, case_id, backup_id)
     for f in folders:
         if f.get("id") == folder_id:
             f["name"] = (name or "Unnamed folder").strip() or "Unnamed folder"
-            save_folders(app_data_root, case_id, folders)
+            save_folders(app_data_root, case_id, backup_id, folders)
             return f
     return None
 
 
-def move_folder(app_data_root: Path, case_id: str, folder_id: str, parent_id: Optional[str]) -> Optional[Dict[str, Any]]:
+def move_folder(
+    app_data_root: Path,
+    case_id: str,
+    backup_id: str,
+    folder_id: str,
+    parent_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
     """Move a folder to a new parent. Rejects self/descendant cycles and any
     attempt to reparent the library root. Returns updated folder or None."""
     if folder_id == LIBRARY_ROOT_FOLDER_ID:
@@ -352,13 +394,13 @@ def move_folder(app_data_root: Path, case_id: str, folder_id: str, parent_id: Op
     target_parent = parent_id or LIBRARY_ROOT_FOLDER_ID
     if folder_id == target_parent:
         return None
-    folders = load_folders(app_data_root, case_id)
+    folders = load_folders(app_data_root, case_id, backup_id)
     if _is_descendant(folders, folder_id, target_parent):
         return None
     for f in folders:
         if f.get("id") == folder_id:
             f["parent_id"] = target_parent
-            save_folders(app_data_root, case_id, folders)
+            save_folders(app_data_root, case_id, backup_id, folders)
             return f
     return None
 
@@ -413,7 +455,12 @@ def descendant_search_count(
     return sum(1 for s in searches if (s.get("folder_id") or None) in ids)
 
 
-def delete_folder_cascade(app_data_root: Path, case_id: str, folder_id: str) -> Tuple[int, int]:
+def delete_folder_cascade(
+    app_data_root: Path,
+    case_id: str,
+    backup_id: str,
+    folder_id: str,
+) -> Tuple[int, int]:
     """
     Delete a folder, all descendant folders, and every saved search inside the subtree.
     Returns (folders_deleted, searches_deleted). The library root folder cannot
@@ -421,8 +468,8 @@ def delete_folder_cascade(app_data_root: Path, case_id: str, folder_id: str) -> 
     """
     if folder_id == LIBRARY_ROOT_FOLDER_ID:
         return (0, 0)
-    folders = load_folders(app_data_root, case_id)
-    searches = load_saved_searches(app_data_root, case_id)
+    folders = load_folders(app_data_root, case_id, backup_id)
+    searches = load_saved_searches(app_data_root, case_id, backup_id)
     ids = set(descendant_folder_ids(folders, folder_id))
     if not ids:
         return (0, 0)
@@ -430,8 +477,8 @@ def delete_folder_cascade(app_data_root: Path, case_id: str, folder_id: str) -> 
     new_searches = [s for s in searches if (s.get("folder_id") or None) not in ids]
     folders_deleted = len(folders) - len(new_folders)
     searches_deleted = len(searches) - len(new_searches)
-    case_root = _case_saved_search_root(app_data_root, case_id)
-    _write_raw(case_root, new_searches, new_folders)
+    storage_root = _backup_saved_search_root(app_data_root, case_id, backup_id)
+    _write_raw(storage_root, new_searches, new_folders)
     return (folders_deleted, searches_deleted)
 
 
@@ -450,7 +497,6 @@ def walk_folders_depth_first(folders: List[Dict[str, Any]]) -> List[Tuple[Dict[s
         by_parent.setdefault(parent, []).append(f)
 
     def _sort_key(f: Dict[str, Any]) -> Tuple[int, str]:
-        # Library root always sorts first within its sibling group.
         is_root = 0 if f.get("id") == LIBRARY_ROOT_FOLDER_ID else 1
         return (is_root, (f.get("name") or "").lower())
 

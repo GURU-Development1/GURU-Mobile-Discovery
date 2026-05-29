@@ -5,12 +5,13 @@ Supports legacy (message/msg_group/group_member/madrid_*) and modern (chat/handl
 
 from __future__ import annotations
 
+import base64
 import re
 import sqlite3
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Apple epoch: seconds between 2001-01-01 and 1970-01-01
 APPLE_EPOCH_OFFSET = 978307200
@@ -47,6 +48,109 @@ def _apple_date_to_unix(apple_date: Optional[int]) -> Optional[float]:
 
 # Well-known fileID for sms.db in iTunes backups (SHA1 of HomeDomain-Library/SMS/sms.db)
 SMS_DB_FILE_ID = "3d0d7e5fb2ce288813306e4d4636395e047a3d28"
+
+# Optional sms.db columns extracted when present (modern + legacy message tables).
+MESSAGE_OPTIONAL_COLUMNS = [
+    "service", "account", "account_guid", "item_type",
+    "group_title", "group_action_type",
+    "is_system_message", "is_service_message", "is_auto_reply",
+]
+
+ATTACHMENT_OPTIONAL_COLUMNS = [
+    "total_bytes", "create_date", "is_outgoing", "transfer_state", "uti",
+    "is_sticker", "hide_attachment",
+]
+
+MESSAGE_APPLE_DATE_COLUMNS = frozenset()
+
+ATTACHMENT_APPLE_DATE_COLUMNS = frozenset({
+    "create_date",
+})
+
+SUPPLEMENTAL_MESSAGE_TABLES = (
+    "deleted_messages",
+    "sync_deleted_messages",
+)
+
+
+def _table_column_map(cur: sqlite3.Cursor, table: str) -> Dict[str, str]:
+    cur.execute(f"PRAGMA table_info({table})")
+    return {(row[1] or "").lower(): row[1] for row in cur.fetchall() if row[1]}
+
+
+def _pick_existing_columns(col_map: Dict[str, str], names: List[str]) -> List[str]:
+    return [col_map[name.lower()] for name in names if name.lower() in col_map]
+
+
+def _pick_cloudkit_columns(col_map: Dict[str, str]) -> List[str]:
+    return [col_map[key] for key in sorted(col_map) if key.startswith("ck_cloudkit")]
+
+
+def _serialize_blob(value: Any, max_len: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value[:max_len]
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, bytes):
+        try:
+            text = value.decode("utf-8")
+            if text and sum(1 for c in text[:80] if c.isprintable() or c in "\r\n\t") >= len(text[:80]) * 0.8:
+                return text[:max_len]
+        except Exception:
+            pass
+        preview = base64.b64encode(value[:128]).decode("ascii")
+        suffix = f" ({len(value)} bytes)" if len(value) > 128 else ""
+        return preview + suffix
+    return str(value)[:max_len]
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y")
+    return bool(value)
+
+
+def _assign_parsed_field(target: dict, key: str, value: Any) -> None:
+    key_lower = key.lower()
+    if key_lower in MESSAGE_APPLE_DATE_COLUMNS:
+        target[f"{key_lower}_timestamp"] = _apple_date_to_unix(value)
+        return
+    if key_lower in ATTACHMENT_APPLE_DATE_COLUMNS:
+        target[f"{key_lower}_timestamp"] = _apple_date_to_unix(value)
+        return
+    if key_lower.startswith("is_"):
+        target[key_lower] = _coerce_bool(value)
+        return
+    if value is None:
+        return
+    if isinstance(value, bytes):
+        target[key_lower] = _serialize_blob(value)
+        return
+    target[key_lower] = value
+
+
+def _row_dict(columns: List[str], row: Tuple[Any, ...]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for idx, col in enumerate(columns):
+        if idx >= len(row):
+            break
+        out[col.lower()] = row[idx]
+    return out
+
+
+def _apply_optional_message_fields(msg: dict, fields: Dict[str, Any]) -> None:
+    for key, value in fields.items():
+        if key in {"rowid", "text", "date", "is_from_me", "handle_id", "chat_id", "guid", "is_deleted"}:
+            continue
+        _assign_parsed_field(msg, key, value)
 
 
 def _get_sms_db_bytes(parser: Any) -> Optional[bytes]:
@@ -324,6 +428,28 @@ def _get_messages_legacy(conn: sqlite3.Connection) -> tuple[List[dict], List[dic
         for m in messages:
             m["is_from_me"] = from_map.get(m["rowid"], False)
 
+    msg_by_rowid = {m["rowid"]: m for m in messages}
+    msg_cols = _table_column_map(cur, "message")
+    optional_msg_cols = _pick_existing_columns(msg_cols, MESSAGE_OPTIONAL_COLUMNS)
+    if "guid" in msg_cols and "guid" not in optional_msg_cols:
+        optional_msg_cols = [msg_cols["guid"]] + optional_msg_cols
+    if optional_msg_cols:
+        cols_sql = ", ".join(["ROWID"] + [f'"{c}"' if not c.isidentifier() else c for c in optional_msg_cols])
+        cur.execute(f"SELECT {cols_sql} FROM message")
+        for row in cur.fetchall():
+            msg = msg_by_rowid.get(row[0])
+            if not msg:
+                continue
+            for i, col in enumerate(optional_msg_cols, start=1):
+                col_lower = col.lower()
+                if col_lower == "guid":
+                    if row[i]:
+                        msg["message_id"] = str(row[i]).strip()
+                    continue
+                _assign_parsed_field(msg, col_lower, row[i])
+    for m in messages:
+        m.setdefault("record_source", "message")
+
     # Attachments: madrid_attachment has message_id, filename, uti_type
     if _table_exists(cur, "madrid_attachment"):
         cur.execute("SELECT message_id, filename, uti_type, ROWID FROM madrid_attachment")
@@ -338,6 +464,9 @@ def _get_messages_legacy(conn: sqlite3.Connection) -> tuple[List[dict], List[dic
         for m in messages:
             m["attachments"] = att_by_msg.get(m["rowid"], [])
 
+    _append_supplemental_messages(cur, messages, chat_by_id={}, handle_by_id={})
+    _attach_recoverable_parts(cur, messages)
+
     # Handles: from group_member or distinct addresses
     seen: set = set()
     for m in messages:
@@ -348,22 +477,141 @@ def _get_messages_legacy(conn: sqlite3.Connection) -> tuple[List[dict], List[dic
     return messages, chats, handles
 
 
-def _get_messages_modern(conn: sqlite3.Connection) -> tuple[List[dict], List[dict], List[dict]]:
-    """Modern schema: chat, handle, chat_message_join, message_attachment_join, attachment."""
-    cur = conn.cursor()
-    messages = []
-    chats = []
-    handles = []
-
+def _load_modern_chats(cur: sqlite3.Cursor) -> Tuple[List[dict], Dict[int, dict]]:
     cur.execute("SELECT ROWID, chat_identifier FROM chat")
-    chat_list = cur.fetchall()
-    for rowid, ident in chat_list:
-        chats.append({
+    chats: List[dict] = []
+    chat_by_id: Dict[int, dict] = {}
+    for rowid, ident in cur.fetchall():
+        chat = {
             "rowid": rowid,
             "display_name": ident or "",
             "chat_identifier": ident or "",
-        })
-    chat_ids = {c["rowid"] for c in chats}
+        }
+        chats.append(chat)
+        chat_by_id[rowid] = chat
+    return chats, chat_by_id
+
+
+def _build_attachment_record(
+    att_cols: Dict[str, str],
+    base_values: Dict[str, Any],
+    extra_values: Dict[str, Any],
+) -> dict:
+    att = {
+        "filename": base_values.get("filename") or base_values.get("transfer_name") or "",
+        "transfer_name": base_values.get("transfer_name") or base_values.get("filename") or "",
+        "mime_type": base_values.get("mime_type") or "",
+        "domain": "HomeDomain",
+        "relative_path": base_values.get("relative_path") or "",
+        "guid": base_values.get("guid") or "",
+    }
+    for key, value in extra_values.items():
+        _assign_parsed_field(att, key, value)
+    return att
+
+
+def _append_supplemental_messages(
+    cur: sqlite3.Cursor,
+    messages: List[dict],
+    chat_by_id: Dict[int, dict],
+    handle_by_id: Dict[int, str],
+) -> None:
+    """Add rows from deleted_messages / sync_deleted_messages when present."""
+    next_negative_rowid = -1
+    for table in SUPPLEMENTAL_MESSAGE_TABLES:
+        if not _table_exists(cur, table):
+            continue
+        col_map = _table_column_map(cur, table)
+        select_cols = ["ROWID"] + _pick_existing_columns(
+            col_map,
+            [
+                "text", "date", "guid", "handle_id", "chat_id", "is_from_me", "service",
+                "account", "account_guid", "item_type", "delete_date",
+            ],
+        )
+        if len(select_cols) <= 1:
+            continue
+        cols_sql = ", ".join(select_cols)
+        cur.execute(f"SELECT {cols_sql} FROM {table}")
+        for row in cur.fetchall():
+            fields = _row_dict(select_cols, row)
+            rowid = fields.pop("rowid")
+            text = fields.pop("text", None)
+            date = fields.pop("date", None) or fields.pop("delete_date", None)
+            guid = fields.pop("guid", None)
+            handle_id = fields.pop("handle_id", None)
+            chat_id = fields.pop("chat_id", None)
+            is_from_me = fields.pop("is_from_me", None)
+            ts = _apple_date_to_unix(date)
+            chat_identifier = ""
+            if chat_id is not None:
+                chat = chat_by_id.get(chat_id)
+                if chat:
+                    chat_identifier = chat.get("chat_identifier") or ""
+            sender_id = handle_by_id.get(handle_id, "") if handle_id else ""
+            msg_dict: Dict[str, Any] = {
+                "rowid": next_negative_rowid,
+                "message_id": str(guid).strip() if guid else f"{table}:{rowid}",
+                "text": _strip_obj_from_text(text),
+                "date": date,
+                "date_timestamp": ts,
+                "date_formatted": "",
+                "is_from_me": _coerce_bool(is_from_me),
+                "handle_id": handle_id,
+                "chat_id": chat_id,
+                "sender_id": sender_id,
+                "chat_identifier": chat_identifier,
+                "attachments": [],
+                "is_deleted": True,
+                "record_source": table,
+            }
+            _apply_optional_message_fields(msg_dict, fields)
+            messages.append(msg_dict)
+            next_negative_rowid -= 1
+
+
+def _attach_recoverable_parts(cur: sqlite3.Cursor, messages: List[dict]) -> None:
+    """Attach recoverable_message_part rows to matching messages when tables exist."""
+    if not _table_exists(cur, "recoverable_message_part"):
+        return
+    part_cols = _table_column_map(cur, "recoverable_message_part")
+    select_cols = ["ROWID"] + _pick_existing_columns(
+        part_cols,
+        ["message_id", "part_index", "data", "content_type", "owner_id", "attribution_info"],
+    )
+    if "message_id" not in {c.lower() for c in select_cols}:
+        return
+    cols_sql = ", ".join(select_cols)
+    cur.execute(f"SELECT {cols_sql} FROM recoverable_message_part")
+    parts_by_message: Dict[int, List[dict]] = defaultdict(list)
+    for row in cur.fetchall():
+        fields = _row_dict(select_cols, row)
+        msg_id = fields.get("message_id")
+        if msg_id is None:
+            continue
+        part: Dict[str, Any] = {"rowid": fields.get("rowid")}
+        for key, value in fields.items():
+            if key in {"rowid", "message_id"}:
+                continue
+            if key == "data":
+                part[key] = _serialize_blob(value)
+            else:
+                part[key] = value
+        parts_by_message[int(msg_id)].append(part)
+    msg_by_rowid = {m["rowid"]: m for m in messages if (m.get("rowid") or 0) > 0}
+    for msg_id, parts in parts_by_message.items():
+        msg = msg_by_rowid.get(msg_id)
+        if msg is not None:
+            msg["recoverable_parts"] = parts
+
+
+def _get_messages_modern(conn: sqlite3.Connection) -> tuple[List[dict], List[dict], List[dict]]:
+    """Modern schema: chat, handle, chat_message_join, message_attachment_join, attachment."""
+    cur = conn.cursor()
+    messages: List[dict] = []
+    handles: List[dict] = []
+
+    chats, chat_by_id = _load_modern_chats(cur)
 
     cur.execute("SELECT ROWID, id FROM handle")
     handle_list = cur.fetchall()
@@ -371,45 +619,38 @@ def _get_messages_modern(conn: sqlite3.Connection) -> tuple[List[dict], List[dic
         handles.append({"rowid": rowid, "id": id_ or ""})
     handle_by_id = {h["rowid"]: h["id"] for h in handles}
 
-    # message table columns: detect guid and is_deleted if present
-    msg_cols: Dict[str, str] = {}
-    cur.execute("PRAGMA table_info(message)")
-    for row in cur.fetchall():
-        if row[1]:
-            msg_cols[row[1].lower()] = row[1]
-    has_guid = "guid" in msg_cols
-    has_is_deleted = "is_deleted" in msg_cols
+    msg_cols = _table_column_map(cur, "message")
+    extra_msg_cols = _pick_existing_columns(msg_cols, MESSAGE_OPTIONAL_COLUMNS)
 
-    select_cols = ["m.ROWID", "m.text", "m.date", "m.is_from_me", "m.handle_id", "cj.chat_id"]
-    if has_guid:
-        select_cols.insert(5, "m.guid")
-    if has_is_deleted:
+    select_cols = ["m.ROWID", "m.text", "m.date", "m.is_from_me", "m.handle_id"]
+    if "guid" in msg_cols:
+        select_cols.append("m.guid")
+    select_cols.append("cj.chat_id")
+    if "is_deleted" in msg_cols:
         select_cols.append("m.is_deleted")
+    for col in extra_msg_cols:
+        select_cols.append(f"m.{col}")
     select_str = ", ".join(select_cols)
     cur.execute(f"""
         SELECT {select_str}
         FROM message m
         JOIN chat_message_join cj ON cj.message_id = m.ROWID
     """)
+    result_cols = [part.split(".")[-1] for part in select_cols]
     for row in cur.fetchall():
-        idx = 0
-        rowid = row[idx]; idx += 1
-        text = row[idx]; idx += 1
-        date = row[idx]; idx += 1
-        is_from_me = row[idx]; idx += 1
-        handle_id = row[idx]; idx += 1
-        guid_val = row[idx] if has_guid else None
-        if has_guid:
-            idx += 1
-        chat_id = row[idx]; idx += 1
-        is_deleted_val = row[idx] if has_is_deleted else None
+        fields = _row_dict(result_cols, row)
+        rowid = fields.pop("rowid")
+        text = fields.pop("text", None)
+        date = fields.pop("date", None)
+        is_from_me = fields.pop("is_from_me", None)
+        handle_id = fields.pop("handle_id", None)
+        guid_val = fields.pop("guid", None)
+        chat_id = fields.pop("chat_id", None)
+        is_deleted_val = fields.pop("is_deleted", None)
 
         ts = _apple_date_to_unix(date)
-        chat_identifier = ""
-        for c in chats:
-            if c["rowid"] == chat_id:
-                chat_identifier = c.get("chat_identifier", "")
-                break
+        chat = chat_by_id.get(chat_id) if chat_id is not None else None
+        chat_identifier = (chat or {}).get("chat_identifier") or ""
         sender_id = handle_by_id.get(handle_id, "") if handle_id else ""
         msg_dict: Dict[str, Any] = {
             "rowid": rowid,
@@ -423,55 +664,62 @@ def _get_messages_modern(conn: sqlite3.Connection) -> tuple[List[dict], List[dic
             "sender_id": sender_id,
             "chat_identifier": chat_identifier,
             "attachments": [],
+            "record_source": "message",
         }
-        msg_dict["message_id"] = str(guid_val).strip() if (has_guid and guid_val) else str(rowid)
-        if has_is_deleted and is_deleted_val:
+        msg_dict["message_id"] = str(guid_val).strip() if guid_val else str(rowid)
+        if is_deleted_val:
             msg_dict["is_deleted"] = bool(is_deleted_val)
+        _apply_optional_message_fields(msg_dict, fields)
         messages.append(msg_dict)
 
-    # message_attachment_join + attachment
     if _table_exists(cur, "message_attachment_join") and _table_exists(cur, "attachment"):
-        # Attachment table may have guid (iOS) for resolving file path in backup
-        cur.execute("PRAGMA table_info(attachment)")
-        att_cols = {row[1].lower(): row[1] for row in cur.fetchall() if row[1]}
-        has_guid = "guid" in att_cols
-        if has_guid:
-            cur.execute("""
-                SELECT maj.message_id, a.filename, a.transfer_name, a.mime_type, a.ROWID, a.guid
-                FROM message_attachment_join maj
-                JOIN attachment a ON a.ROWID = maj.attachment_id
-            """)
-        else:
-            cur.execute("""
-                SELECT maj.message_id, a.filename, a.transfer_name, a.mime_type, a.ROWID
-                FROM message_attachment_join maj
-                JOIN attachment a ON a.ROWID = maj.attachment_id
-            """)
+        att_cols = _table_column_map(cur, "attachment")
+        base_att_cols = ["filename", "transfer_name", "mime_type", "ROWID"]
+        if "guid" in att_cols:
+            base_att_cols.append("guid")
+        optional_att_cols = _pick_existing_columns(att_cols, ATTACHMENT_OPTIONAL_COLUMNS)
+        optional_att_cols.extend(_pick_cloudkit_columns(att_cols))
+        select_att = ["maj.message_id"] + [f"a.{c}" for c in base_att_cols if c != "ROWID"] + ["a.ROWID"]
+        for col in optional_att_cols:
+            if col.lower() not in {c.lower() for c in base_att_cols}:
+                select_att.append(f"a.{col}")
+        att_result_cols = [part.split(".")[-1] for part in select_att]
+        cur.execute(f"""
+            SELECT {", ".join(select_att)}
+            FROM message_attachment_join maj
+            JOIN attachment a ON a.ROWID = maj.attachment_id
+        """)
         att_by_msg: Dict[int, List[dict]] = {}
         for row in cur.fetchall():
-            msg_id = row[0]
-            filename = row[1] or ""
-            transfer_name = row[2] or ""
-            mime = row[3] or ""
-            att_id = row[4]
-            guid = row[5] if has_guid and len(row) > 5 else ""
-            # Use filename as relative_path if it looks like a path (e.g. Library/SMS/Attachments/...)
+            fields = _row_dict(att_result_cols, row)
+            msg_id = fields.pop("message_id")
+            row_id = fields.pop("rowid", None)
+            filename = fields.pop("filename", "") or ""
+            transfer_name = fields.pop("transfer_name", "") or ""
+            mime = fields.pop("mime_type", "") or ""
+            guid = fields.pop("guid", "") or ""
             rel_path = ""
             fname = (filename or transfer_name or "").strip()
             if fname and ("/" in fname or "\\" in fname):
                 rel_path = fname.replace("\\", "/").lstrip("/")
-            att_by_msg.setdefault(msg_id, []).append({
-                "filename": filename or transfer_name or "",
-                "transfer_name": transfer_name or filename or "",
-                "mime_type": mime or "",
-                "domain": "HomeDomain",
-                "relative_path": rel_path,
-                "guid": guid,
-            })
+            att_by_msg.setdefault(msg_id, []).append(
+                _build_attachment_record(
+                    att_cols,
+                    {
+                        "filename": filename,
+                        "transfer_name": transfer_name,
+                        "mime_type": mime,
+                        "guid": guid,
+                        "relative_path": rel_path,
+                    },
+                    fields,
+                )
+            )
+            if row_id is not None:
+                att_by_msg[msg_id][-1]["rowid"] = row_id
         for m in messages:
             m["attachments"] = att_by_msg.get(m["rowid"], [])
 
-    # Participants per chat: from chat_handle_join if present, else from distinct handles in messages
     participants_by_chat: Dict[int, List[str]] = {}
     if _table_exists(cur, "chat_handle_join"):
         cur.execute("SELECT chat_id, handle_id FROM chat_handle_join")
@@ -498,6 +746,9 @@ def _get_messages_modern(conn: sqlite3.Connection) -> tuple[List[dict], List[dic
                 participants_by_chat[rowid] = ids
     for c in chats:
         c["participant_handle_ids"] = participants_by_chat.get(c["rowid"], [])
+
+    _append_supplemental_messages(cur, messages, chat_by_id, handle_by_id)
+    _attach_recoverable_parts(cur, messages)
 
     return messages, chats, handles
 

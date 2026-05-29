@@ -286,7 +286,7 @@ QComboBox QAbstractItemView {
 
 /* Do not style #SavedSearchesTree::branch — QSS on ::branch forces Qt's stylesheet branch path and PE_IndicatorBranch is never drawn (no proxy chevrons). */
 
-/* Case / backup tree (no disclosure column — RootIsDecorated off, indentation 0) */
+/* Case / backup tree — disclosure chevrons painted by SavedSearchesTreeProxyStyle on CaseTreeWidget */
 QTreeWidget#CaseImportTree {
     background-color: #ffffff;
     border: 1px solid #e1e6ed;
@@ -343,6 +343,24 @@ QHeaderView:horizontal::section:first {
     border-top-left-radius: 0;
 }
 
+QHeaderView#TableSortHeader {
+    padding: 0;
+    margin: 0;
+    border: none;
+    background: transparent;
+}
+
+QHeaderView#TableSortHeader::section {
+    background: transparent;
+    padding: 0;
+    margin: 0;
+    border: none;
+}
+
+QHeaderView#TableSortHeader::section:hover {
+    background: transparent;
+}
+
 QHeaderView:vertical::section {
     background-color: #f0f3f7;
     padding: 2px 6px;
@@ -351,6 +369,18 @@ QHeaderView:vertical::section {
     border-bottom: 1px solid #eef1f5;
     font-weight: 600;
     color: #2c3441;
+}
+
+QLineEdit#TableColumnFilter {
+    background-color: #ffffff;
+    border: 1px solid #d8dfe8;
+    border-radius: 4px;
+    padding: 2px 8px;
+    color: #1f2937;
+}
+
+QLineEdit#TableColumnFilter:focus {
+    border-color: #4a73b8;
 }
 
 /* =========================================================

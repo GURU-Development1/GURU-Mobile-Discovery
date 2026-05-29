@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QStyle,
+    QStyleFactory,
     QLineEdit,
     QDialogButtonBox,
 )
@@ -43,7 +44,7 @@ from .search_dialog import SearchDialog
 from .export_dialog import ExportRsmfDialog
 from .thread_export_dialog import ThreadExportDialog
 from .thread_export_preview_dialog import ThreadExportPreviewDialog
-from .message_views import MessageViews
+from .message_views import MessageViews, SavedSearchesTreeProxyStyle
 from .style import icon as load_icon, logo_path as resolve_logo_path
 from . import cache
 from .import_worker import run_import, extract_attachments_to_cache
@@ -86,9 +87,16 @@ class CaseTreeWidget(QTreeWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("CaseImportTree")
+        self._suppress_restore_selection = False
+        base = QStyleFactory.create("Fusion") or QApplication.style()
+        proxy = SavedSearchesTreeProxyStyle(base)
+        proxy.setParent(self)
+        self.setStyle(proxy)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.RightButton:
+            self._suppress_restore_selection = True
+        elif event.button() == Qt.MouseButton.LeftButton:
             item = self.itemAt(event.position().toPoint())
             if item is None:
                 event.accept()
@@ -387,13 +395,11 @@ class MainWindow(QMainWindow):
         self._tree.setHeaderLabels(["Cases"])
         self._tree.setHeaderHidden(True)
         self._tree.setItemsExpandable(True)
-        self._tree.setRootIsDecorated(False)
-        self._tree.setIndentation(0)
+        self._tree.setRootIsDecorated(True)
+        self._tree.setIndentation(18)
+        self._tree.setIconSize(QSize(16, 16))
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
-        self._tree.itemClicked.connect(self._on_tree_item_clicked)
-        self._tree.itemExpanded.connect(self._on_tree_item_expanded_collapsed)
-        self._tree.itemCollapsed.connect(self._on_tree_item_expanded_collapsed)
         self._tree.currentItemChanged.connect(self._on_tree_selection_changed)
         tree_layout.addWidget(self._tree)
         self._main_splitter.addWidget(self._tree_container)
@@ -637,6 +643,7 @@ class MainWindow(QMainWindow):
                 label = meta.get("backup_label") or meta.get("device_name") or meta.get("backup_id") or backup_id
                 back_item = QTreeWidgetItem(case_item, [label])
                 back_item.setData(0, Qt.ItemDataRole.UserRole, ("backup", case_id, backup_id))
+                back_item.setIcon(0, load_icon("phone"))
                 self._item_to_case_id[id(back_item)] = case_id
                 self._item_to_backup_id[id(back_item)] = backup_id
             case_item.setExpanded(False)
@@ -654,6 +661,8 @@ class MainWindow(QMainWindow):
         return None
 
     def _restore_backup_tree_selection(self) -> None:
+        if getattr(self._tree, "_suppress_restore_selection", False):
+            return
         if not self._current_case_id or not self._current_backup_id:
             return
         item = self._find_backup_tree_item(self._current_case_id, self._current_backup_id)
@@ -689,20 +698,13 @@ class MainWindow(QMainWindow):
             delete_act = QAction("Delete case", self)
             delete_act.triggered.connect(lambda: self._confirm_delete_case(item))
             menu.addAction(delete_act)
-        menu.exec(self._tree.mapToGlobal(position))
-
-    def _on_tree_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
-        """Toggle expand/collapse when clicking a case item (no backup_id)."""
-        backup_id = self._item_to_backup_id.get(id(item))
-        if backup_id is None and item.childCount() > 0:
-            item.setExpanded(not item.isExpanded())
-
-    def _on_tree_item_expanded_collapsed(self, item: QTreeWidgetItem) -> None:
-        """Update icon when case item is expanded or collapsed."""
-        self._update_case_item_icon(item)
+        try:
+            menu.exec(self._tree.mapToGlobal(position))
+        finally:
+            self._tree._suppress_restore_selection = False
 
     def _update_case_item_icon(self, item: QTreeWidgetItem) -> None:
-        """Set case item icon (arrow-right collapsed, arrow-down expanded) and text."""
+        """Set case item briefcase icon and label text."""
         if self._item_to_backup_id.get(id(item)) is not None:
             return
         case_id = self._item_to_case_id.get(id(item))
@@ -710,16 +712,11 @@ class MainWindow(QMainWindow):
             return
         name = self._cases.get(case_id, "Case")
         item.setText(0, name)
-        chev = load_icon("chevron-down" if item.isExpanded() else "chevron-right")
-        if chev.isNull():
+        case_icon = load_icon("briefcase")
+        if case_icon.isNull():
             style = QApplication.style()
-            fallback = style.standardIcon(
-                QStyle.StandardPixmap.SP_ArrowDown
-                if item.isExpanded()
-                else QStyle.StandardPixmap.SP_ArrowRight
-            )
-            chev = QIcon(fallback.pixmap(QSize(12, 12)))
-        item.setIcon(0, chev)
+            case_icon = style.standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        item.setIcon(0, case_icon)
 
     def _on_tree_selection_changed(self) -> None:
         item = self._tree.currentItem()
@@ -844,6 +841,7 @@ class MainWindow(QMainWindow):
         self._message_views.set_app_data_root(
             self._app_data_root,
             case_id=case_id,
+            backup_id=backup_id,
             library_display_name=lib_name,
         )
         self._message_views.show_thread_view()
@@ -1028,6 +1026,7 @@ class MainWindow(QMainWindow):
         dlg = SearchDialog(
             self._app_data_root,
             self._current_case_id,
+            self._current_backup_id,
             self,
             default_folder_id=default_folder_id,
             library_display_name=lib_name,
@@ -1048,7 +1047,9 @@ class MainWindow(QMainWindow):
             return
         from app.saved_searches import load_saved_searches
 
-        searches = load_saved_searches(self._app_data_root, self._current_case_id)
+        searches = load_saved_searches(
+            self._app_data_root, self._current_case_id, self._current_backup_id
+        )
         saved = next((s for s in searches if s.get("id") == search_id), None)
         if saved is None:
             QMessageBox.warning(self, "Edit Search", "This saved search could not be found.")
@@ -1058,6 +1059,7 @@ class MainWindow(QMainWindow):
         dlg = SearchDialog(
             self._app_data_root,
             self._current_case_id,
+            self._current_backup_id,
             self,
             library_display_name=lib_name,
             edit_search=saved,
@@ -1335,7 +1337,9 @@ class MainWindow(QMainWindow):
         if self._current_case_id == case_id:
             self._current_case_id = None
             self._current_backup_id = None
-            self._message_views.set_app_data_root(self._app_data_root)
+            self._message_views.set_app_data_root(
+                self._app_data_root, case_id=None, backup_id=None
+            )
             self._stack.setCurrentWidget(self._placeholder)
             self._refresh_file_menu_backup_actions()
 

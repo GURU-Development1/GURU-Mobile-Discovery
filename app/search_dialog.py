@@ -17,26 +17,21 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLabel,
     QCheckBox,
-    QComboBox,
     QMessageBox,
     QDateEdit,
     QCalendarWidget,
     QAbstractSpinBox,
     QWidget,
-    QListWidget,
-    QListWidgetItem,
 )
 from PyQt6.QtCore import QDate, Qt, QSize, pyqtSignal
 
 from app.saved_searches import (
     LIBRARY_ROOT_FOLDER_ID,
-    LIBRARY_ROOT_FOLDER_NAME,
     add_saved_search,
-    load_folders,
     update_saved_search,
-    walk_folders_depth_first,
 )
 from app.style import icon as load_icon
+from app.thread_picker_dialog import ThreadPickerDialog
 
 
 def _criteria_from_form(
@@ -70,6 +65,7 @@ class SearchDialog(QDialog):
         self,
         app_data_root: Path,
         case_id: str,
+        backup_id: str,
         parent=None,
         default_folder_id: Optional[str] = None,
         library_display_name: Optional[str] = None,
@@ -79,8 +75,12 @@ class SearchDialog(QDialog):
         super().__init__(parent)
         self._app_data_root = Path(app_data_root)
         self._case_id = case_id
-        self._edit_search_id = (edit_search or {}).get("id")
+        self._backup_id = backup_id
+        self._default_folder_id = default_folder_id or LIBRARY_ROOT_FOLDER_ID
+        self._edit_search = edit_search or {}
+        self._edit_search_id = self._edit_search.get("id")
         self._chats = list(chats or [])
+        self._selected_thread_ids: List[int] = []
         self.setWindowTitle("Edit search" if self._edit_search_id else "Search messages")
         self.setMinimumWidth(480)
         self.setWindowFlag(Qt.WindowType.MSWindowsFixedSizeDialogHint, True)
@@ -92,27 +92,6 @@ class SearchDialog(QDialog):
         self._name_edit.setPlaceholderText("Name for saving this search")
         form.addRow("Search name:", self._name_edit)
 
-        self._folder_combo = QComboBox()
-        folders = load_folders(
-            self._app_data_root,
-            self._case_id,
-            library_display_name=library_display_name,
-        )
-        select_index = 0
-        target_id = (edit_search or {}).get("folder_id") or default_folder_id or LIBRARY_ROOT_FOLDER_ID
-        for i, (folder, depth) in enumerate(walk_folders_depth_first(folders)):
-            label = ("    " * depth) + (folder.get("name") or "Unnamed folder")
-            self._folder_combo.addItem(label, folder.get("id"))
-            if folder.get("id") == target_id:
-                select_index = i
-        if self._folder_combo.count() == 0:
-            # Defensive fallback: library root should always exist after load_folders,
-            # but guarantee at least one selectable entry so the combo isn't empty.
-            root_label = (library_display_name or "").strip() or LIBRARY_ROOT_FOLDER_NAME
-            self._folder_combo.addItem(root_label, LIBRARY_ROOT_FOLDER_ID)
-        self._folder_combo.setCurrentIndex(select_index)
-        form.addRow("Folder:", self._folder_combo)
-
         self._to_edit = QLineEdit()
         self._to_edit.setPlaceholderText(
             "Contact name or phone number (comma-separated for multiple)"
@@ -123,21 +102,16 @@ class SearchDialog(QDialog):
         )
         form.addRow("Recipient:", self._to_edit)
 
-        self._threads_list = QListWidget()
-        self._threads_list.setMaximumHeight(140)
-        self._threads_list.setToolTip(
-            "Optional: limit search to selected threads. Leave all unchecked to search every thread."
+        threads_row = QHBoxLayout()
+        self._threads_summary = QLabel()
+        self._threads_summary.setToolTip(
+            "Optional: limit search to selected threads. Leave empty to search every thread."
         )
-        for ch in self._chats:
-            cid = ch.get("rowid")
-            label = ch.get("label") or f"Chat {cid}"
-            count = ch.get("count", 0)
-            item = QListWidgetItem(f"{label} ({count})")
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setData(Qt.ItemDataRole.UserRole, cid)
-            item.setCheckState(Qt.CheckState.Unchecked)
-            self._threads_list.addItem(item)
-        form.addRow("Threads:", self._threads_list)
+        select_threads_btn = QPushButton("Select threads...")
+        select_threads_btn.clicked.connect(self._open_thread_picker)
+        threads_row.addWidget(select_threads_btn)
+        threads_row.addWidget(self._threads_summary, stretch=1)
+        form.addRow("Threads:", threads_row)
 
         self._body_edit = QLineEdit()
         self._body_edit.setPlaceholderText("Message body contains...")
@@ -221,9 +195,6 @@ class SearchDialog(QDialog):
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
-        self.adjustSize()
-        self.setFixedSize(self.size())
-
         if edit_search:
             self._name_edit.setText(edit_search.get("name") or "")
             self._to_edit.setText(edit_search.get("to_filter") or "")
@@ -231,12 +202,32 @@ class SearchDialog(QDialog):
             self._set_date_edit_from_ymd(self._date_from_edit, edit_search.get("date_from") or "")
             self._set_date_edit_from_ymd(self._date_to_edit, edit_search.get("date_to") or "")
             self._chunk_24h_cb.setChecked(bool(edit_search.get("chunk_24h")))
-            selected_ids = {int(t) for t in (edit_search.get("thread_ids") or []) if t is not None}
-            for i in range(self._threads_list.count()):
-                item = self._threads_list.item(i)
-                cid = item.data(Qt.ItemDataRole.UserRole)
-                if cid is not None and int(cid) in selected_ids:
-                    item.setCheckState(Qt.CheckState.Checked)
+            self._selected_thread_ids = [
+                int(t) for t in (edit_search.get("thread_ids") or []) if t is not None
+            ]
+
+        self._refresh_threads_summary()
+        self.adjustSize()
+        self.setFixedSize(self.size())
+
+    def _refresh_threads_summary(self) -> None:
+        n = len(self._selected_thread_ids)
+        if n == 0:
+            self._threads_summary.setText("All threads")
+        elif n == 1:
+            self._threads_summary.setText("1 thread selected")
+        else:
+            self._threads_summary.setText(f"{n} threads selected")
+
+    def _open_thread_picker(self) -> None:
+        dlg = ThreadPickerDialog(
+            self._chats,
+            selected_ids=self._selected_thread_ids,
+            parent=self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._selected_thread_ids = dlg.selected_thread_ids()
+            self._refresh_threads_summary()
 
     def _set_date_edit_from_ymd(self, w: QDateEdit, ymd: str) -> None:
         text = (ymd or "").strip()
@@ -277,16 +268,6 @@ class SearchDialog(QDialog):
             return ""
         return d.toString("yyyy-MM-dd")
 
-    def _selected_thread_ids(self) -> List[int]:
-        ids: List[int] = []
-        for i in range(self._threads_list.count()):
-            item = self._threads_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                cid = item.data(Qt.ItemDataRole.UserRole)
-                if cid is not None:
-                    ids.append(int(cid))
-        return ids
-
     def _get_criteria(self) -> Dict[str, Any]:
         return _criteria_from_form(
             self._to_edit.text(),
@@ -295,8 +276,13 @@ class SearchDialog(QDialog):
             self._date_to_ymd(self._date_to_edit),
             self._chunk_24h_cb.isChecked(),
             self._name_edit.text(),
-            self._selected_thread_ids(),
+            self._selected_thread_ids,
         )
+
+    def _folder_id_for_save(self) -> str:
+        if self._edit_search_id:
+            return self._edit_search.get("folder_id") or LIBRARY_ROOT_FOLDER_ID
+        return self._default_folder_id
 
     def _on_save_and_search(self) -> None:
         name = self._name_edit.text().strip()
@@ -304,11 +290,12 @@ class SearchDialog(QDialog):
             QMessageBox.warning(self, "Save search", "Enter a name for this search.")
             return
         criteria = self._get_criteria()
-        folder_id = self._folder_combo.currentData() or LIBRARY_ROOT_FOLDER_ID
+        folder_id = self._folder_id_for_save()
         if self._edit_search_id:
             item = update_saved_search(
                 self._app_data_root,
                 self._case_id,
+                self._backup_id,
                 self._edit_search_id,
                 name=name,
                 to_filter=criteria["to_filter"],
@@ -328,6 +315,7 @@ class SearchDialog(QDialog):
             item = add_saved_search(
                 self._app_data_root,
                 self._case_id,
+                self._backup_id,
                 name=name,
                 to_filter=criteria["to_filter"],
                 body_filter=criteria["body_filter"],

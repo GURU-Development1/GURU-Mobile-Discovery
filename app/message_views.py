@@ -29,7 +29,6 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QStyleFactory,
-    QStyleOptionHeader,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QTableWidget,
@@ -261,39 +260,40 @@ def _message_unix_timestamp(m: dict) -> Optional[float]:
     return _apple_date_to_unix(raw_date)
 
 
-class FilterHeaderView(QHeaderView):
-    """Header with sort (left) and filter (right) click zones; right edge reserved for resize."""
+class TableSortHeaderView(QHeaderView):
+    """Single-row grey header: column titles, click to sort, chevron when sorted."""
 
-    RESIZE_HIT = 12  # pixels around the column boundary used for resize cursor/drag
-    FILTER_ZONE = 26
+    TITLE_HEIGHT = 30
+    RESIZE_HIT = 12
     TEXT_PAD_LEFT = 11
-    TEXT_PAD_RIGHT = 6
-    SORT_INDICATOR_WIDTH = 16
+    TEXT_PAD_RIGHT = 22
+    SORT_INDICATOR_WIDTH = 14
     CLICK_SLOP = 8
+    _HEADER_BG = QColor("#f0f3f7")
+    _HEADER_BORDER = QColor("#d8dfe8")
+    _HEADER_TEXT = QColor("#2c3441")
 
-    filter_clicked = pyqtSignal(int)
     sort_clicked = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
-        self._active_columns: set = set()
+        self.setObjectName("TableSortHeader")
         self.setSectionsClickable(False)
-        self.setHighlightSections(True)
+        self.setHighlightSections(False)
         self.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.setFixedHeight(self.TITLE_HEIGHT + TableColumnFilterRow.FILTER_HEIGHT)
+        title_font = QFont(self.font())
+        title_font.setWeight(QFont.Weight.DemiBold)
+        self.setFont(title_font)
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setStyleSheet(
+            "QHeaderView#TableSortHeader { padding: 0; margin: 0; border: none; background: transparent; }"
+            "QHeaderView#TableSortHeader::section { background: transparent; border: none; padding: 0; margin: 0; }"
+            "QHeaderView#TableSortHeader::section:hover { background: transparent; }"
+        )
         self._pending_click: Optional[tuple[int, str]] = None
         self._press_origin: Optional[QPoint] = None
         self._resize_active = False
-
-    @property
-    def _filter_zone(self) -> int:
-        return self.FILTER_ZONE
-
-    @property
-    def RESIZE_GRIP(self) -> int:
-        return self.RESIZE_HIT
-
-    def reserved_trailing_width(self) -> int:
-        return self.RESIZE_HIT + self.FILTER_ZONE
 
     def _header_label(self, logical_index: int) -> str:
         model = self.model()
@@ -303,9 +303,7 @@ class FilterHeaderView(QHeaderView):
         return str(value) if value is not None else ""
 
     def _label_font_metrics(self) -> QFontMetrics:
-        font = QFont(self.font())
-        font.setWeight(QFont.Weight.DemiBold)
-        return QFontMetrics(font)
+        return QFontMetrics(self.font())
 
     def minimumSectionWidth(self, logical_index: int) -> int:
         label = self._header_label(logical_index)
@@ -315,11 +313,10 @@ class FilterHeaderView(QHeaderView):
             + text_w
             + self.SORT_INDICATOR_WIDTH
             + self.TEXT_PAD_RIGHT
-            + self.reserved_trailing_width()
+            + self.RESIZE_HIT
         )
 
     def _resize_handle_index(self, pos_x: int) -> int:
-        """Section whose right edge is near pos_x, or -1."""
         half = self.RESIZE_HIT // 2
         for i in range(self.count()):
             if self.isSectionHidden(i):
@@ -336,17 +333,7 @@ class FilterHeaderView(QHeaderView):
         idx = self.logicalIndexAt(pos_x)
         if idx < 0:
             return (-1, "")
-        x0 = self.sectionPosition(idx)
-        rel = pos_x - x0
-        sz = self.sectionSize(idx)
-        trailing = self.reserved_trailing_width()
-        if rel >= sz - trailing:
-            return (idx, "filter")
         return (idx, "sort")
-
-    def set_active_columns(self, cols: set) -> None:
-        self._active_columns = set(cols)
-        self.viewport().update()
 
     def leaveEvent(self, event) -> None:
         if not self._resize_active:
@@ -357,8 +344,8 @@ class FilterHeaderView(QHeaderView):
         if self._resize_active:
             super().mouseMoveEvent(event)
             return
-        pos = int(event.position().x())
-        if self._resize_handle_index(pos) >= 0:
+        pos_x = int(event.position().x())
+        if self._resize_handle_index(pos_x) >= 0:
             self.setCursor(Qt.CursorShape.SplitHCursor)
         else:
             self.unsetCursor()
@@ -370,16 +357,16 @@ class FilterHeaderView(QHeaderView):
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
-        pos = int(event.position().x())
-        handle = self._resize_handle_index(pos)
+        pos_x = int(event.position().x())
+        handle = self._resize_handle_index(pos_x)
         if handle >= 0:
             self._pending_click = None
             self._press_origin = None
             self._resize_active = True
             super().mousePressEvent(event)
             return
-        idx, zone = self._zone_at(pos)
-        if idx < 0 or zone not in ("filter", "sort"):
+        idx, zone = self._zone_at(pos_x)
+        if idx < 0 or zone != "sort":
             return super().mousePressEvent(event)
         self._pending_click = (idx, zone)
         self._press_origin = event.position().toPoint()
@@ -393,8 +380,8 @@ class FilterHeaderView(QHeaderView):
             super().mouseReleaseEvent(event)
             return
         if event.button() == Qt.MouseButton.LeftButton and self._pending_click is not None:
-            pos = int(event.position().x())
-            idx, zone = self._zone_at(pos)
+            pos_x = int(event.position().x())
+            idx, zone = self._zone_at(pos_x)
             pending_idx, pending_zone = self._pending_click
             if (
                 idx == pending_idx
@@ -402,10 +389,7 @@ class FilterHeaderView(QHeaderView):
                 and self._press_origin is not None
                 and (event.position().toPoint() - self._press_origin).manhattanLength() <= self.CLICK_SLOP
             ):
-                if zone == "filter":
-                    self.filter_clicked.emit(idx)
-                elif zone == "sort":
-                    self.sort_clicked.emit(idx)
+                self.sort_clicked.emit(idx)
             self._pending_click = None
             self._press_origin = None
             event.accept()
@@ -413,86 +397,170 @@ class FilterHeaderView(QHeaderView):
         super().mouseReleaseEvent(event)
 
     def paintSection(self, painter: QPainter, rect: QRect, logicalIndex: int) -> None:
-        reserved = self.reserved_trailing_width()
-        content_rect = rect.adjusted(0, 0, -reserved, 0)
+        title_rect = QRect(rect.left(), rect.top(), rect.width(), self.TITLE_HEIGHT)
+        painter.fillRect(title_rect, self._HEADER_BG)
+        painter.fillRect(title_rect.left(), title_rect.bottom() - 1, title_rect.width(), 1, self._HEADER_BORDER)
+        if logicalIndex == 0:
+            painter.fillRect(title_rect.left(), title_rect.top(), 1, title_rect.height(), self._HEADER_BORDER)
+        painter.fillRect(title_rect.right(), title_rect.top(), 1, title_rect.height(), self._HEADER_BORDER)
 
-        opt = QStyleOptionHeader()
-        self.initStyleOption(opt)
-        opt.rect = content_rect
-        opt.section = logicalIndex
-        opt.text = self._header_label(logicalIndex)
-        opt.textAlignment = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        opt.sortIndicator = QStyleOptionHeader.SortIndicator.SortNone
-        self.style().drawControl(QStyle.ControlElement.CE_Header, opt, painter, self)
-
-        grip = self.RESIZE_HIT
-        fr_w = max(12, self.FILTER_ZONE - 4)
-        fr_left = rect.right() - grip - self.FILTER_ZONE + 2
-        fr = QRect(fr_left, rect.top() + 2, fr_w, rect.height() - 4)
-
-        indicator = ""
-        use_highlight = logicalIndex in self._active_columns
-        if self.isSortIndicatorShown() and self.sortIndicatorSection() == logicalIndex:
-            if self.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder:
-                indicator = "\u2191"
-            else:
-                indicator = "\u2193"
-        elif use_highlight:
-            indicator = "\u23f7"
-
-        if not indicator:
-            return
-
-        painter.save()
-        pal = self.palette()
-        c = pal.color(pal.ColorGroup.Active, pal.ColorRole.Highlight) if use_highlight else pal.color(
-            pal.ColorGroup.Active, pal.ColorRole.Mid
+        label = self._header_label(logicalIndex)
+        fm = self._label_font_metrics()
+        text_width = max(0, title_rect.width() - self.TEXT_PAD_LEFT - self.TEXT_PAD_RIGHT)
+        text_rect = QRect(
+            title_rect.left() + self.TEXT_PAD_LEFT,
+            title_rect.top(),
+            text_width,
+            title_rect.height(),
         )
-        painter.setPen(c)
-        painter.drawText(fr, Qt.AlignmentFlag.AlignCenter, indicator)
-        painter.restore()
+        painter.setPen(self._HEADER_TEXT)
+        painter.drawText(
+            text_rect,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            fm.elidedText(label, Qt.TextElideMode.ElideRight, text_width),
+        )
+
+        if self.isSortIndicatorShown() and self.sortIndicatorSection() == logicalIndex:
+            chevron = "\u02c4" if self.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder else "\u02c5"
+            chevron_rect = QRect(
+                title_rect.right() - self.TEXT_PAD_RIGHT,
+                title_rect.top(),
+                self.TEXT_PAD_RIGHT,
+                title_rect.height(),
+            )
+            painter.drawText(chevron_rect, int(Qt.AlignmentFlag.AlignCenter), chevron)
 
 
-class ColumnFilterDialog(QDialog):
-    def __init__(self, column_title: str, initial: str, parent=None):
+class TableColumnFilterRow(QWidget):
+    """Filter inputs aligned to table columns, sitting directly under the sort header."""
+
+    FILTER_HEIGHT = 32
+    _HEADER_BG = QColor("#f0f3f7")
+    _HEADER_BORDER = QColor("#d8dfe8")
+
+    filter_changed = pyqtSignal(int, str)
+
+    def __init__(self, table: QTableWidget, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Filter — {column_title}")
-        self._edit = QLineEdit()
-        self._edit.setText(initial)
-        self._edit.setPlaceholderText("Filter… (substring, case-insensitive)")
-        lay = QVBoxLayout(self)
-        lay.addWidget(QLabel(f"Show rows where \"{column_title}\" contains:"))
-        lay.addWidget(self._edit)
-        clear_btn = QPushButton("Clear filter")
-        clear_btn.clicked.connect(lambda: self._edit.clear())
-        row = QHBoxLayout()
-        row.addWidget(clear_btn)
-        row.addStretch()
-        lay.addLayout(row)
-        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        box.accepted.connect(self.accept)
-        box.rejected.connect(self.reject)
-        lay.addWidget(box)
+        self._table = table
+        self._filter_edits: List[QLineEdit] = []
+        self._building_filters = False
+        self.setFixedHeight(self.FILTER_HEIGHT)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
-    def text(self) -> str:
-        return self._edit.text()
+    def filter_edits(self) -> List[QLineEdit]:
+        return self._filter_edits
+
+    def set_column_count(self, count: int) -> None:
+        while len(self._filter_edits) < count:
+            col = len(self._filter_edits)
+            edit = QLineEdit(self)
+            edit.setObjectName("TableColumnFilter")
+            edit.setPlaceholderText("Filter")
+            edit.textChanged.connect(lambda text, c=col: self._on_filter_text(c, text))
+            self._filter_edits.append(edit)
+        for i, edit in enumerate(self._filter_edits):
+            edit.setVisible(i < count)
+
+    def clear_filters(self) -> None:
+        self._building_filters = True
+        try:
+            for edit in self._filter_edits:
+                edit.blockSignals(True)
+                edit.clear()
+                edit.blockSignals(False)
+        finally:
+            self._building_filters = False
+
+    def _on_filter_text(self, col: int, text: str) -> None:
+        if self._building_filters:
+            return
+        self.filter_changed.emit(col, text)
+
+    def sync_to_columns(self) -> None:
+        if not self.isVisible():
+            return
+        table = self._table
+        hdr = table.horizontalHeader()
+        if hdr is None:
+            return
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        vp = table.viewport()
+        filter_x = vp.mapTo(parent, QPoint(0, 0)).x()
+        filter_y = hdr.mapTo(parent, QPoint(0, TableSortHeaderView.TITLE_HEIGHT)).y()
+        filter_w = vp.width()
+        self.setGeometry(filter_x, filter_y, max(0, filter_w), self.FILTER_HEIGHT)
+
+        pad_x = 4
+        pad_y = 4
+        edit_h = max(20, self.FILTER_HEIGHT - (pad_y * 2))
+        scroll_x = hdr.offset()
+        for i, edit in enumerate(self._filter_edits):
+            if i >= hdr.count() or not edit.isVisible():
+                edit.hide()
+                continue
+            x = hdr.sectionPosition(i) - scroll_x
+            w = hdr.sectionSize(i)
+            if x + w <= 0 or x >= filter_w:
+                edit.hide()
+                continue
+            edit.setGeometry(pad_x + x, pad_y, max(0, w - (pad_x * 2)), edit_h)
+            edit.show()
+        self.update()
+        self.raise_()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self._HEADER_BG)
+        hdr = self._table.horizontalHeader()
+        if hdr is None:
+            return
+        scroll_x = hdr.offset()
+        for i in range(hdr.count()):
+            if hdr.isSectionHidden(i):
+                continue
+            x = hdr.sectionPosition(i) - scroll_x
+            w = hdr.sectionSize(i)
+            if x + w <= 0 or x >= self.width():
+                continue
+            if i == 0 or x <= 0:
+                painter.fillRect(max(0, x), 0, 1, self.height(), self._HEADER_BORDER)
+            painter.fillRect(x + w - 1, 0, 1, self.height(), self._HEADER_BORDER)
+        painter.fillRect(0, self.height() - 1, self.width(), 1, self._HEADER_BORDER)
+
+
+_TABLE_COLUMN_SPECS: List[tuple[str, str, str]] = [
+    ("Message Sent Date", "date_formatted", "main_date"),
+    ("From", "display_name", "text"),
+    ("Recipient", "chat_display_name", "text"),
+    ("Conversation ID", "conversation_id", "text"),
+    ("Message ID", "message_id", "text"),
+    ("Control Number", "control_number", "text"),
+    ("Is Deleted", "is_deleted", "bool"),
+    ("Attachments", "attachments", "attachment_count"),
+    ("Body", "text", "body"),
+    ("Hash", "hash", "text"),
+    ("Service", "service", "text"),
+    ("Account", "account", "text"),
+    ("Account GUID", "account_guid", "text"),
+    ("Item Type", "item_type", "text"),
+    ("Group Title", "group_title", "text"),
+    ("Group Action Type", "group_action_type", "text"),
+    ("Is System Message", "is_system_message", "bool"),
+    ("Is Service Message", "is_service_message", "bool"),
+    ("Is Auto Reply", "is_auto_reply", "bool"),
+    ("Record Source", "record_source", "text"),
+    ("Recoverable Parts", "recoverable_parts", "count"),
+]
 
 
 class TableView(QWidget):
     """Table of messages with column sort (3-state) and per-column filters."""
 
-    _HEADER_LABELS = [
-        "Message Sent Date",
-        "From",
-        "Recipient",
-        "Conversation ID",
-        "Message ID",
-        "Control Number",
-        "Is Deleted",
-        "Attachments",
-        "Body",
-        "Hash",
-    ]
+    _HEADER_LABELS = [spec[0] for spec in _TABLE_COLUMN_SPECS]
+    _BODY_COLUMN_INDEX = next(i for i, spec in enumerate(_TABLE_COLUMN_SPECS) if spec[2] == "body")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -508,80 +576,113 @@ class TableView(QWidget):
         self._table.setShowGrid(True)
         self._table.setSortingEnabled(False)
         vheader = self._table.verticalHeader()
+        vheader.setVisible(False)
+        vheader.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         vheader.setDefaultSectionSize(30)
         vheader.setMinimumSectionSize(26)
 
-        hdr = FilterHeaderView(self._table)
+        hdr = TableSortHeaderView(self._table)
         self._table.setHorizontalHeader(hdr)
         hdr.sort_clicked.connect(self._on_header_sort)
-        hdr.filter_clicked.connect(self._on_header_filter)
         self._filter_header = hdr
+
+        self._filter_row = TableColumnFilterRow(self._table, self)
+        self._filter_row.set_column_count(len(self._HEADER_LABELS))
+        self._filter_row.filter_changed.connect(self._on_filter_changed)
 
         self._table.setColumnCount(len(self._HEADER_LABELS))
         self._table.setHorizontalHeaderLabels(list(self._HEADER_LABELS))
         self._apply_default_column_widths()
+        self._connect_filter_row_sync()
+        self._sync_filter_row()
 
         layout.addWidget(self._table)
-        self._columns = [
-            "date_formatted", "display_name", "chat_display_name", "conversation_id",
-            "message_id", "control_number", "is_deleted", "attachment_count", "message body", "hash",
-        ]
+        self._columns = list(self._HEADER_LABELS)
         self._messages_original: List[dict] = []
         self._timezone_name = ""
         self._filters: List[str] = [""] * len(self._columns)
         self._sort_col: Optional[int] = None
         self._sort_cycle = 0  # 0=default, 1=asc, 2=desc
 
+    def _connect_filter_row_sync(self) -> None:
+        hdr = self._filter_header
+        hdr.sectionResized.connect(lambda *_: self._sync_filter_row())
+        hdr.geometriesChanged.connect(self._sync_filter_row)
+        self._table.horizontalScrollBar().valueChanged.connect(lambda *_: self._sync_filter_row())
+
+    def _sync_filter_row(self) -> None:
+        self._filter_row.sync_to_columns()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_filter_row()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_filter_row()
+
     def _apply_default_column_widths(self) -> None:
         hdr = self._filter_header
-        # Minimum data widths for columns whose cell content is typically wider than the header.
-        content_mins = [180, 140, 200, 170, 120, 140, 0, 0, 320, 160]
-        body_col = 8
+        body_col = self._BODY_COLUMN_INDEX
         for i in range(self._table.columnCount()):
             header_min = hdr.minimumSectionWidth(i)
             hdr.setMinimumSectionSize(header_min)
-            content_min = content_mins[i] if i < len(content_mins) else 0
             if i == body_col:
                 hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
-                hdr.resizeSection(i, max(header_min, content_min))
+                hdr.resizeSection(i, max(header_min, 320))
             else:
                 hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
-                hdr.resizeSection(i, max(header_min, content_min))
+                default_w = 180 if i == 0 else 140
+                hdr.resizeSection(i, max(header_min, default_w))
+
+    def _cell_value_for_spec(self, m: dict, spec: tuple[str, str, str]) -> str:
+        _label, key, kind = spec
+        tz = self._timezone_name
+        if kind == "main_date":
+            date_display = (m.get("date_formatted") or "").strip()
+            if not date_display:
+                unix_ts = _message_unix_timestamp(m)
+                if unix_ts is not None:
+                    date_display = _format_date_from_timestamp(unix_ts, tz)
+            if not date_display:
+                date_display = "(no date)"
+            if tz and date_display != "(no date)":
+                unix_ts = _message_unix_timestamp(m)
+                if unix_ts is not None:
+                    abbrev = get_tz_abbrev_for_timestamp(unix_ts, tz)
+                    if abbrev:
+                        date_display = date_display + f" ({abbrev})"
+            return date_display
+        if kind == "date":
+            fmt_key = key.replace("_timestamp", "_formatted")
+            formatted = (m.get(fmt_key) or "").strip()
+            if formatted:
+                return formatted
+            ts = m.get(key)
+            return _format_date_from_timestamp(ts, tz) if ts is not None else ""
+        if kind == "bool":
+            return "Yes" if m.get(key) else ""
+        if kind == "attachment_count":
+            return str(len(m.get("attachments") or []))
+        if kind == "count":
+            val = m.get(key)
+            return str(len(val)) if isinstance(val, list) else (str(val) if val not in (None, "") else "")
+        if kind == "body":
+            to_str = m.get("to_display") or m.get("chat_display_name") or m.get("chat_identifier") or ""
+            if key == "text":
+                return (m.get("text") or "").replace("\n", " ")[:200]
+            return to_str
+        return str(m.get(key) or "")
 
     def _row_strings_for_message(self, m: dict) -> List[str]:
-        tz = self._timezone_name
         to_str = m.get("to_display") or m.get("chat_display_name") or m.get("chat_identifier") or ""
-        att_count = len(m.get("attachments") or [])
-        body = (m.get("text") or "").replace("\n", " ")[:200]
-        date_display = (m.get("date_formatted") or "").strip()
-        if not date_display:
-            unix_ts = _message_unix_timestamp(m)
-            if unix_ts is not None:
-                date_display = _format_date_from_timestamp(unix_ts, tz)
-        if not date_display:
-            date_display = "(no date)"
-        if tz and date_display != "(no date)":
-            unix_ts = _message_unix_timestamp(m)
-            if unix_ts is not None:
-                abbrev = get_tz_abbrev_for_timestamp(unix_ts, tz)
-                if abbrev:
-                    date_display = date_display + f" ({abbrev})"
-        conv_id = m.get("conversation_id") or ""
-        msg_id = m.get("message_id") or ""
-        ctrl_num = m.get("control_number") or ""
-        is_del = "Yes" if m.get("is_deleted") else ""
-        return [
-            date_display,
-            m.get("display_name") or "",
-            to_str,
-            conv_id,
-            msg_id,
-            ctrl_num,
-            is_del,
-            str(att_count),
-            body,
-            m.get("hash") or "",
-        ]
+        values: List[str] = []
+        for spec in _TABLE_COLUMN_SPECS:
+            if spec[1] == "chat_display_name":
+                values.append(to_str)
+            else:
+                values.append(self._cell_value_for_spec(m, spec))
+        return values
 
     def _passes_filters(self, m: dict) -> bool:
         texts = self._row_strings_for_message(m)
@@ -597,13 +698,20 @@ class TableView(QWidget):
         return (m.get("date_timestamp") or 0, m.get("rowid") or 0)
 
     def _sort_key(self, m: dict, col: int):
-        if col == 0:
-            return (0, _message_unix_timestamp(m) or 0)
-        if col == 7:
+        if col < 0 or col >= len(_TABLE_COLUMN_SPECS):
+            return (1, "")
+        _label, key, kind = _TABLE_COLUMN_SPECS[col]
+        if kind in ("main_date", "date"):
+            ts_key = key if kind == "date" else "date_timestamp"
+            return (0, float(m.get(ts_key) or 0))
+        if kind == "attachment_count":
             return (0, len(m.get("attachments") or []))
-        if col == 6:
-            return (0, 1 if m.get("is_deleted") else 0)
-        return (1, (self._row_strings_for_message(m)[col] or "").lower())
+        if kind == "count":
+            val = m.get(key)
+            return (0, len(val) if isinstance(val, list) else 0)
+        if kind == "bool":
+            return (0, 1 if m.get(key) else 0)
+        return (1, (self._cell_value_for_spec(m, _TABLE_COLUMN_SPECS[col]) or "").lower())
 
     def _apply_sort(self, msgs: List[dict]) -> List[dict]:
         if self._sort_cycle == 0 or self._sort_col is None:
@@ -616,8 +724,6 @@ class TableView(QWidget):
         msgs = [m for m in self._messages_original if self._passes_filters(m)]
         msgs = self._apply_sort(msgs)
         self._fill_rows(msgs, progress_callback=progress_callback)
-        active = {i for i, f in enumerate(self._filters) if (f or "").strip()}
-        self._filter_header.set_active_columns(active)
 
     def _fill_rows(
         self,
@@ -662,6 +768,7 @@ class TableView(QWidget):
         self._filters = [""] * len(self._columns)
         self._sort_col = None
         self._sort_cycle = 0
+        self._filter_row.clear_filters()
         self._table.horizontalHeader().setSortIndicatorShown(False)
         self._rebuild(progress_callback=progress_callback)
 
@@ -682,14 +789,10 @@ class TableView(QWidget):
             hdr.setSortIndicator(self._sort_col, order)
         self._rebuild()
 
-    def _on_header_filter(self, col: int) -> None:
-        if col < 0 or col >= len(self._HEADER_LABELS):
+    def _on_filter_changed(self, col: int, text: str) -> None:
+        if col < 0 or col >= len(self._filters):
             return
-        dlg = ColumnFilterDialog(self._HEADER_LABELS[col], self._filters[col], self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        t = dlg.text()
-        self._filters[col] = t
+        self._filters[col] = text
         self._rebuild()
 
 
@@ -807,6 +910,7 @@ class SavedSearchesTree(QTreeWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._app_data_root: Optional[Path] = None
         self._case_id: Optional[str] = None
+        self._backup_id: Optional[str] = None
         self._drag_source_item: Optional[QTreeWidgetItem] = None
         # Fusion keeps whole-row selection aligned with QSS; proxy paints disclosure chevrons
         # because Fusion ignores branch `image:` in stylesheets on Windows.
@@ -841,9 +945,15 @@ class SavedSearchesTree(QTreeWidget):
             return
         super().drawRow(painter, option, index)
 
-    def set_saved_search_storage(self, p: Optional[Path], case_id: Optional[str]) -> None:
+    def set_saved_search_storage(
+        self,
+        p: Optional[Path],
+        case_id: Optional[str],
+        backup_id: Optional[str] = None,
+    ) -> None:
         self._app_data_root = p
         self._case_id = case_id
+        self._backup_id = backup_id
 
     def startDrag(self, supportedActions) -> None:
         self._drag_source_item = self.currentItem()
@@ -862,7 +972,7 @@ class SavedSearchesTree(QTreeWidget):
 
     def dropEvent(self, event) -> None:
         try:
-            if self._app_data_root is None or self._case_id is None:
+            if self._app_data_root is None or self._case_id is None or self._backup_id is None:
                 event.ignore()
                 return
             source = self._drag_source_item or self.currentItem()
@@ -907,11 +1017,15 @@ class SavedSearchesTree(QTreeWidget):
                     target_folder_id = _parent_folder_id(target)
 
             if src_kind == "folder":
-                if move_folder(self._app_data_root, self._case_id, src_id, target_folder_id) is None:
+                if move_folder(
+                    self._app_data_root, self._case_id, self._backup_id, src_id, target_folder_id
+                ) is None:
                     event.ignore()
                     return
             elif src_kind == "search":
-                if update_saved_search(self._app_data_root, self._case_id, src_id, folder_id=target_folder_id) is None:
+                if update_saved_search(
+                    self._app_data_root, self._case_id, self._backup_id, src_id, folder_id=target_folder_id
+                ) is None:
                     event.ignore()
                     return
             else:
@@ -1086,13 +1200,15 @@ class MessageViews(QWidget):
         self,
         path: Optional[Path],
         case_id: Optional[str] = None,
+        backup_id: Optional[str] = None,
         library_display_name: Optional[str] = None,
     ) -> None:
         self._app_data_root = path
         self._case_id = case_id
+        self._backup_id = backup_id
         disp = (library_display_name or "").strip()
         self._library_display_name = disp or None
-        self._saved_searches_tree.set_saved_search_storage(path, case_id)
+        self._saved_searches_tree.set_saved_search_storage(path, case_id, backup_id)
         self._refresh_saved_searches_tree()
 
     def _on_search_tab_activated(self, index: int) -> None:
@@ -1135,7 +1251,7 @@ class MessageViews(QWidget):
             selected_data = current.data(0, Qt.ItemDataRole.UserRole)
 
         tree.clear()
-        if not self._app_data_root or not self._case_id:
+        if not self._app_data_root or not self._case_id or not self._backup_id:
             return
 
         self._suppress_search_selection_run = True
@@ -1143,11 +1259,13 @@ class MessageViews(QWidget):
             folders = load_folders(
                 self._app_data_root,
                 self._case_id,
+                self._backup_id,
                 library_display_name=self._library_display_name,
             )
             searches = load_saved_searches(
                 self._app_data_root,
                 self._case_id,
+                self._backup_id,
                 library_display_name=self._library_display_name,
             )
 
@@ -1259,7 +1377,7 @@ class MessageViews(QWidget):
         return LIBRARY_ROOT_FOLDER_ID
 
     def _create_folder(self, parent_id: Optional[str]) -> None:
-        if not self._app_data_root or not self._case_id:
+        if not self._app_data_root or not self._case_id or not self._backup_id:
             return
         name, ok = QInputDialog.getText(self, "New folder", "Folder name:")
         if not ok:
@@ -1267,7 +1385,13 @@ class MessageViews(QWidget):
         name = (name or "").strip()
         if not name:
             return
-        add_folder(self._app_data_root, self._case_id, name, parent_id=parent_id or LIBRARY_ROOT_FOLDER_ID)
+        add_folder(
+            self._app_data_root,
+            self._case_id,
+            self._backup_id,
+            name,
+            parent_id=parent_id or LIBRARY_ROOT_FOLDER_ID,
+        )
         self._refresh_saved_searches_tree()
 
     def _on_tree_context_menu(self, pos) -> None:
@@ -1285,12 +1409,11 @@ class MessageViews(QWidget):
                 "New search",
                 lambda: self.add_search_requested.emit(ident),
             )
-            # Library root: searches only — no subfolders; cannot rename or delete (see saved_searches).
+            menu.addAction(
+                "New subfolder",
+                lambda: self._create_folder(parent_id=ident),
+            )
             if not is_library_root_folder_id(ident):
-                menu.addAction(
-                    "New subfolder",
-                    lambda: self._create_folder(parent_id=ident),
-                )
                 menu.addSeparator()
                 menu.addAction("Rename folder...", lambda: self._on_rename_folder(ident))
                 menu.addAction("Delete folder...", lambda: self._on_delete_folder(ident))
@@ -1306,9 +1429,9 @@ class MessageViews(QWidget):
     def _on_rename_folder(self, folder_id: str) -> None:
         if is_library_root_folder_id(folder_id):
             return
-        if not self._app_data_root or not self._case_id:
+        if not self._app_data_root or not self._case_id or not self._backup_id:
             return
-        folders = load_folders(self._app_data_root, self._case_id)
+        folders = load_folders(self._app_data_root, self._case_id, self._backup_id)
         current = next((f for f in folders if f.get("id") == folder_id), None)
         if current is None:
             return
@@ -1323,16 +1446,16 @@ class MessageViews(QWidget):
         name = (name or "").strip()
         if not name:
             return
-        rename_folder(self._app_data_root, self._case_id, folder_id, name)
+        rename_folder(self._app_data_root, self._case_id, self._backup_id, folder_id, name)
         self._refresh_saved_searches_tree()
 
     def _on_delete_folder(self, folder_id: str) -> None:
         if is_library_root_folder_id(folder_id):
             return
-        if not self._app_data_root or not self._case_id:
+        if not self._app_data_root or not self._case_id or not self._backup_id:
             return
-        folders = load_folders(self._app_data_root, self._case_id)
-        searches = load_saved_searches(self._app_data_root, self._case_id)
+        folders = load_folders(self._app_data_root, self._case_id, self._backup_id)
+        searches = load_saved_searches(self._app_data_root, self._case_id, self._backup_id)
         target = next((f for f in folders if f.get("id") == folder_id), None)
         if target is None:
             return
@@ -1354,17 +1477,22 @@ class MessageViews(QWidget):
         ) == QMessageBox.StandardButton.Yes
         if not ok:
             return
-        _, deleted_searches = delete_folder_cascade(self._app_data_root, self._case_id, folder_id)
+        _, deleted_searches = delete_folder_cascade(
+            self._app_data_root, self._case_id, self._backup_id, folder_id
+        )
         if deleted_searches and self._current_search_id is not None:
-            remaining = {s.get("id") for s in load_saved_searches(self._app_data_root, self._case_id)}
+            remaining = {
+                s.get("id")
+                for s in load_saved_searches(self._app_data_root, self._case_id, self._backup_id)
+            }
             if self._current_search_id not in remaining:
                 self.clear_search_results()
         self._refresh_saved_searches_tree()
 
     def _on_rename_search(self, search_id: str) -> None:
-        if not self._app_data_root or not self._case_id:
+        if not self._app_data_root or not self._case_id or not self._backup_id:
             return
-        searches = load_saved_searches(self._app_data_root, self._case_id)
+        searches = load_saved_searches(self._app_data_root, self._case_id, self._backup_id)
         current = next((s for s in searches if s.get("id") == search_id), None)
         if current is None:
             return
@@ -1379,12 +1507,12 @@ class MessageViews(QWidget):
         name = (name or "").strip()
         if not name:
             return
-        update_saved_search(self._app_data_root, self._case_id, search_id, name=name)
+        update_saved_search(self._app_data_root, self._case_id, self._backup_id, search_id, name=name)
         self._refresh_saved_searches_tree()
 
     def _on_delete_search(self, search_id: Optional[str]) -> None:
         """Delete a saved search and clear its results if currently displayed."""
-        if not search_id or not self._app_data_root or not self._case_id:
+        if not search_id or not self._app_data_root or not self._case_id or not self._backup_id:
             return
         ok = QMessageBox.question(
             self,
@@ -1395,7 +1523,7 @@ class MessageViews(QWidget):
         ) == QMessageBox.StandardButton.Yes
         if not ok:
             return
-        if delete_saved_search(self._app_data_root, self._case_id, search_id):
+        if delete_saved_search(self._app_data_root, self._case_id, self._backup_id, search_id):
             if self._current_search_id == search_id:
                 self.clear_search_results()
             self._refresh_saved_searches_tree()

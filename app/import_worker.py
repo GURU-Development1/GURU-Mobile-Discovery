@@ -62,6 +62,19 @@ def _apply_timezone(messages: List[dict], tz_name: str) -> None:
     except Exception:
         tz = zoneinfo.ZoneInfo("UTC")
     APPLE_EPOCH = 978307200
+
+    def _format_ts(ts: float) -> str:
+        try:
+            ts = float(ts)
+            if ts > 1e15:
+                ts = (ts / 1_000_000_000.0) + APPLE_EPOCH
+            dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+            dt_local = dt_utc.astimezone(tz)
+            h12 = dt_local.hour % 12 or 12
+            return f"{dt_local.month}/{dt_local.day:02d}/{dt_local.year} {h12}:{dt_local.minute:02d}:{dt_local.second:02d} {dt_local.strftime('%p')}"
+        except Exception:
+            return ""
+
     for m in messages:
         ts = m.get("date_timestamp")
         if ts is None:
@@ -72,12 +85,7 @@ def _apply_timezone(messages: List[dict], tz_name: str) -> None:
             if ts > 1e15:
                 ts = (ts / 1_000_000_000.0) + APPLE_EPOCH
                 m["date_timestamp"] = ts
-            # Backup timestamps are UTC (Unix epoch). Interpret explicitly as UTC, then convert to target tz.
-            dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
-            dt_local = dt_utc.astimezone(tz)
-            # Store as m/dd/yyyy hh:mm:ss AM/PM for display
-            h12 = dt_local.hour % 12 or 12
-            m["date_formatted"] = f"{dt_local.month}/{dt_local.day:02d}/{dt_local.year} {h12}:{dt_local.minute:02d}:{dt_local.second:02d} {dt_local.strftime('%p')}"
+            m["date_formatted"] = _format_ts(ts)
             m["date_timestamp"] = ts  # keep for sorting
         except Exception:
             pass
