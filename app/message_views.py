@@ -107,8 +107,9 @@ def _make_side_toolbar_row(
     return row
 
 
-_SEARCH_SELECTED_BG = "#d6e4f5"
-_SEARCH_SELECTED_TEXT = "#1f2937"
+_SAVED_SEARCHES_SELECTED_BG = "#8fadda"
+_SAVED_SEARCHES_HOVER_BG = "#dde6f3"
+_SAVED_SEARCHES_SELECTED_TEXT = "#ffffff"
 
 
 class TableWidgetWithShiftWheel(QTableWidget):
@@ -797,10 +798,14 @@ class TableView(QWidget):
 
 
 class SavedSearchesTreeProxyStyle(QProxyStyle):
-    """Fusion + global QSS often omit visible tree disclosure markers; draw chevrons here."""
+    """Fusion + global QSS often omit visible tree disclosure markers; draw chevrons here.
+
+    The chevron sits in its own column outside the rounded selection pill, so
+    its color is independent of row selection — we always paint it in the same
+    neutral gray regardless of State_Selected.
+    """
 
     _CHEVRON_GRAY = QColor("#6b7280")
-    _CHEVRON_WHITE = QColor("#ffffff")
 
     def __init__(self, base_style: QStyle):
         super().__init__(base_style)
@@ -822,30 +827,30 @@ class SavedSearchesTreeProxyStyle(QProxyStyle):
             rect = option.rect
             if rect.width() >= 4 and rect.height() >= 4:
                 expanded = bool(option.state & QStyle.StateFlag.State_Open)
-                selected = bool(option.state & QStyle.StateFlag.State_Selected)
-                color = self._CHEVRON_WHITE if selected else self._CHEVRON_GRAY
 
                 painter.save()
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                painter.setBrush(color)
+                painter.setBrush(self._CHEVRON_GRAY)
                 painter.setPen(Qt.PenStyle.NoPen)
 
                 cx = rect.center().x()
                 cy = rect.center().y()
+                # Half-size chevron: ~8px wide / ~5px tall instead of the
+                # previous ~14px / ~11px.
                 cell_h = min(rect.height(), 22)
-                half_w = max(4, min(8, cell_h // 3))
+                half_w = max(2, min(4, cell_h // 6))
 
                 if expanded:
                     points = [
-                        QPoint(cx - half_w, cy - 4),
-                        QPoint(cx + half_w, cy - 4),
-                        QPoint(cx, cy + max(4, half_w)),
+                        QPoint(cx - half_w, cy - 2),
+                        QPoint(cx + half_w, cy - 2),
+                        QPoint(cx, cy + max(2, half_w)),
                     ]
                 else:
                     points = [
-                        QPoint(cx - 4, cy - half_w),
-                        QPoint(cx + max(4, half_w), cy),
-                        QPoint(cx - 4, cy + half_w),
+                        QPoint(cx - 2, cy - half_w),
+                        QPoint(cx + max(2, half_w), cy),
+                        QPoint(cx - 2, cy + half_w),
                     ]
                 painter.drawPolygon(QPolygon(points))
                 painter.restore()
@@ -859,41 +864,68 @@ _SEARCH_CRITERIA_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 class SavedSearchesTreeDelegate(QStyledItemDelegate):
-    """Saved-search rows: full-row highlight when selected; no hover fill when not selected."""
+    """Renders saved-search and folder rows without their own selection background.
+
+    The rounded pill is painted by SavedSearchesTree.drawRow (depth-aware: a
+    full-width pill for top-level folders, an offset pill for nested items).
+    This delegate just clears State_Selected/State_MouseOver/State_HasFocus and
+    forces a transparent background brush so Qt's default per-cell selection
+    fill doesn't paint a stray rectangle on top of the pill. The selected text
+    color is forced to white via the option palette so it stays readable on the
+    blue pill.
+    """
+
+    _SELECTED_TEXT = QColor(_SAVED_SEARCHES_SELECTED_TEXT)
 
     def __init__(self, tree: QTreeWidget, parent=None):
         super().__init__(parent)
         self._tree = tree
 
-    def _is_search_item(self, index) -> bool:
-        item = self._tree.itemFromIndex(index)
-        return SavedSearchesTree._item_is_search(item)
-
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
-        if not self._is_search_item(index):
-            super().paint(painter, option, index)
-            return
-        item = self._tree.itemFromIndex(index)
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        selected = item is not None and item.isSelected()
+        was_selected = bool(option.state & QStyle.StateFlag.State_Selected)
         opt.state &= ~(
             QStyle.StateFlag.State_Selected
             | QStyle.StateFlag.State_MouseOver
             | QStyle.StateFlag.State_HasFocus
         )
         opt.backgroundBrush = QBrush(Qt.GlobalColor.transparent)
-        if selected:
-            text_color = QColor(_SEARCH_SELECTED_TEXT)
-            opt.palette.setColor(QPalette.ColorRole.Text, text_color)
-            opt.palette.setColor(QPalette.ColorRole.WindowText, text_color)
+        if was_selected:
+            opt.palette.setColor(QPalette.ColorRole.Text, self._SELECTED_TEXT)
+            opt.palette.setColor(QPalette.ColorRole.WindowText, self._SELECTED_TEXT)
+            opt.palette.setColor(QPalette.ColorRole.HighlightedText, self._SELECTED_TEXT)
         super().paint(painter, opt, index)
 
 
 class SavedSearchesTree(QTreeWidget):
-    """Tree of folders + saved searches. Supports internal drag-drop with persistence."""
+    """Tree of folders + saved searches. Supports internal drag-drop with persistence.
+
+    Visual model (mirrors CaseTreeWidget):
+      - **Top-level** folders paint a rounded pill that spans the full viewport
+        width — the disclosure chevron, folder icon, and label all live inside
+        one continuous element flush with the left edge of the panel.
+      - **Nested** folders and saved-search rows paint a self-contained pill
+        starting just before their item rect, so they appear visually offset to
+        the right under their parent folder.
+    Qt's default selection highlight is forced transparent across every palette
+    color group so the system selection color cannot leak through behind the
+    custom pill, and a full-viewport repaint runs on every selection change so
+    stale pill pixels (which extend past the per-item visualRect) are cleared.
+    """
 
     item_moved = pyqtSignal()  # emitted after a successful drop persists a folder_id/parent_id change
+
+    _SELECTED_BG = QColor(_SAVED_SEARCHES_SELECTED_BG)
+    _HOVER_BG = QColor(_SAVED_SEARCHES_HOVER_BG)
+    _PILL_RADIUS = 6
+    _PILL_HMARGIN = 2
+    _PILL_VMARGIN = 1
+    # Just a small sliver of pill before the folder / search icon — close
+    # enough that the icon reads as "inside" the highlight, but small enough
+    # that the disclosure chevron in the indent column to the left stays
+    # outside the pill with visible breathing room.
+    _NESTED_LEFT_INSET = 1
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -919,6 +951,25 @@ class SavedSearchesTree(QTreeWidget):
         proxy.setParent(self)
         self.setStyle(proxy)
         self.setItemDelegate(SavedSearchesTreeDelegate(self, self))
+        # Hover must register over the chevron column too so the top-level pill
+        # highlights cleanly when the cursor is over the disclosure arrow.
+        self.setMouseTracking(True)
+        # Suppress Qt's default selection highlight across every palette group
+        # so the system selection color cannot paint behind our custom pill.
+        pal = self.palette()
+        transparent = QColor(0, 0, 0, 0)
+        for group in (
+            QPalette.ColorGroup.Active,
+            QPalette.ColorGroup.Inactive,
+            QPalette.ColorGroup.Disabled,
+        ):
+            pal.setColor(group, QPalette.ColorRole.Highlight, transparent)
+        self.setPalette(pal)
+        # The custom pill is wider than each item's visualRect, so a selection
+        # change otherwise leaves a sliver of the previous pill behind until
+        # the next paint. Force a full-viewport repaint on every selection
+        # change to clear it.
+        self.itemSelectionChanged.connect(self.viewport().update)
 
     @staticmethod
     def _item_is_search(item: Optional[QTreeWidgetItem]) -> bool:
@@ -927,22 +978,64 @@ class SavedSearchesTree(QTreeWidget):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         return isinstance(data, tuple) and data[0] == "search"
 
+    def expand_folder_by_id(self, folder_id: Optional[str]) -> bool:
+        """Expand the folder item whose UserRole data is ('folder', folder_id).
+
+        Used by the message-views container after creating a new subfolder or
+        saved search inside an existing folder so the new child is immediately
+        visible instead of being hidden behind a collapsed parent. Returns True
+        if a matching folder was found and expanded.
+        """
+        if not folder_id:
+            return False
+
+        def visit(item: QTreeWidgetItem) -> bool:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(data, tuple) and data[0] == "folder" and data[1] == folder_id:
+                item.setExpanded(True)
+                return True
+            for i in range(item.childCount()):
+                if visit(item.child(i)):
+                    return True
+            return False
+
+        root = self.invisibleRootItem()
+        for i in range(root.childCount()):
+            if visit(root.child(i)):
+                return True
+        return False
+
     def drawRow(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
         item = self.itemFromIndex(index)
-        if self._item_is_search(item):
-            if item is not None and item.isSelected():
-                full = QRect(option.rect)
-                full.setLeft(0)
-                full.setRight(self.viewport().width())
-                painter.fillRect(full, QColor(_SEARCH_SELECTED_BG))
-            row_opt = QStyleOptionViewItem(option)
-            row_opt.state &= ~(
-                QStyle.StateFlag.State_Selected
-                | QStyle.StateFlag.State_MouseOver
-                | QStyle.StateFlag.State_HasFocus
+        selected = item is not None and item.isSelected()
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        if selected or hovered:
+            # Every row's pill (top-level folder, nested folder, or saved search)
+            # starts just before the item rect — i.e. just before the folder /
+            # search icon — and excludes the disclosure chevron column to its
+            # left. Nested rows therefore appear naturally offset under their
+            # parent's chevron, and top-level rows align with their own icon
+            # instead of swallowing the chevron into the highlight.
+            item_rect = self.visualRect(index)
+            viewport_rect = self.viewport().rect()
+            left = max(
+                viewport_rect.left() + self._PILL_HMARGIN,
+                item_rect.left() - self._NESTED_LEFT_INSET,
             )
-            super().drawRow(painter, row_opt, index)
-            return
+            right = viewport_rect.right() - self._PILL_HMARGIN
+            pill = QRect(
+                left,
+                option.rect.y() + self._PILL_VMARGIN,
+                max(0, right - left),
+                option.rect.height() - 2 * self._PILL_VMARGIN,
+            )
+            color = self._SELECTED_BG if selected else self._HOVER_BG
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(pill, self._PILL_RADIUS, self._PILL_RADIUS)
+            painter.restore()
         super().drawRow(painter, option, index)
 
     def set_saved_search_storage(
@@ -1032,8 +1125,27 @@ class SavedSearchesTree(QTreeWidget):
                 event.ignore()
                 return
 
+            # Force the drop action to Copy. Qt's QAbstractItemView::startDrag
+            # otherwise calls clearOrRemove() on the source rows after this
+            # method returns (because defaultDropAction is MoveAction), which
+            # would delete rows out of the tree we're about to rebuild and
+            # leave the moved folder visually missing until something else
+            # triggers another refresh (tab switch). Since we already persisted
+            # the move via move_folder/update_saved_search and rebuild from
+            # storage via item_moved.emit() below, the source-row removal is
+            # both unnecessary and harmful.
+            event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+            # Rebuild the tree from storage. _refresh_saved_searches_tree
+            # captures expansion state up front, so the moved folder retains
+            # its open/closed state (and all its subfolders + searches keep
+            # their structure, since move_folder only retargets the folder's
+            # parent_id — children are reattached purely from storage).
             self.item_moved.emit()
+            # Make sure the destination folder is expanded so the just-moved
+            # row is visible instead of being hidden under a collapsed parent.
+            if target_folder_id:
+                self.expand_folder_by_id(target_folder_id)
         finally:
             self._drag_source_item = None
 
@@ -1385,14 +1497,18 @@ class MessageViews(QWidget):
         name = (name or "").strip()
         if not name:
             return
+        effective_parent_id = parent_id or LIBRARY_ROOT_FOLDER_ID
         add_folder(
             self._app_data_root,
             self._case_id,
             self._backup_id,
             name,
-            parent_id=parent_id or LIBRARY_ROOT_FOLDER_ID,
+            parent_id=effective_parent_id,
         )
         self._refresh_saved_searches_tree()
+        # Make the parent's new child immediately visible — a freshly created
+        # subfolder should never be hidden behind a collapsed parent.
+        self._saved_searches_tree.expand_folder_by_id(effective_parent_id)
 
     def _on_tree_context_menu(self, pos) -> None:
         tree = self._saved_searches_tree
@@ -1783,10 +1899,17 @@ class MessageViews(QWidget):
         self._search_table_view.setVisible(True)
         self._tabs.setCurrentIndex(2)
 
-    def refresh_saved_searches_list(self) -> None:
-        """Reload the saved searches tree (e.g. after saving a new search from the dialog)."""
+    def refresh_saved_searches_list(self, expand_folder_id: Optional[str] = None) -> None:
+        """Reload the saved searches tree (e.g. after saving a new search from the dialog).
+
+        If ``expand_folder_id`` is provided, that folder is expanded after the
+        refresh so a search just dropped into it is visible immediately instead
+        of being hidden behind a collapsed parent.
+        """
         if self._tabs.currentIndex() == 2:
             self._refresh_saved_searches_tree()
+            if expand_folder_id:
+                self._saved_searches_tree.expand_folder_by_id(expand_folder_id)
 
     def show_search_tab(self) -> None:
         """Switch to the Search tab."""

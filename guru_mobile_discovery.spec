@@ -14,7 +14,7 @@ _extra_datas: list = []
 _extra_binaries: list = []
 _hiddenimports: set[str] = set()
 
-for _pkg in ("tzdata", "pillow_heif", "iphone_backup_decrypt", "requests", "certifi", "urllib3"):
+for _pkg in ("tzdata", "pillow_heif", "iphone_backup_decrypt", "cryptography"):
     try:
         d, b, h = collect_all(_pkg)
         _extra_datas += d

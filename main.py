@@ -14,6 +14,7 @@ from app.paths import ensure_temp_dir_on_data_drive, get_app_data_root
 from app.main_window import MainWindow
 from app.style import get_stylesheet, init_assets_root
 from app.version import __version__
+from app.license_config import SAMPLE_LICENSE_TOKEN
 from app.license_service import LicenseService, LicenseStatus
 from app.license_dialog import LicenseDialog
 
@@ -38,7 +39,11 @@ def _ensure_licensed(app: QApplication, license_service: LicenseService) -> bool
     if status == LicenseStatus.VALID:
         return True
 
-    prefilled = license_service.cached_key() if license_service.is_cached() else ""
+    prefilled = ""
+    if not getattr(sys, "frozen", False):
+        prefilled = SAMPLE_LICENSE_TOKEN
+    elif license_service.is_cached():
+        prefilled = license_service.cached_key()
     dlg = LicenseDialog(
         license_service,
         parent=None,

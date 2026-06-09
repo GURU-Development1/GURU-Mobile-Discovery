@@ -11,3 +11,8 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Cloudflare Worker (billing)
+server/billing/node_modules/
+server/billing/.dev.vars
+server/billing/.wrangler/

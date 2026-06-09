@@ -1,70 +1,61 @@
 /**
- * License-delivery email via Resend.
- *
- * The buyer receives the license key after a successful Lemon Squeezy purchase.
- * Plain text and HTML variants are sent so the message renders cleanly in clients
- * that block remote content.
+ * Send license key emails via Resend.
  */
 
-import { Resend } from "resend";
 import type { Env } from "./types";
+import type { LicensePayload } from "./types";
+import { formatExpiry } from "./license";
 
-export async function sendLicenseDelivery(
+export async function sendLicenseEmail(
   env: Env,
-  to: string,
-  licenseKey: string,
+  toEmail: string,
+  token: string,
+  payload: LicensePayload,
 ): Promise<void> {
-  const resend = new Resend(env.RESEND_API_KEY);
-  const subject = "Your GURU Mobile Discovery license key";
-  const html = renderLicenseEmailHtml(licenseKey);
-  const text = renderLicenseEmailText(licenseKey);
-
-  const { error } = await resend.emails.send({
-    from: env.RESEND_FROM_EMAIL,
-    to,
-    subject,
-    html,
-    text,
-  });
-  if (error) {
-    const message = (error as { message?: string }).message || JSON.stringify(error);
-    throw new Error(`Resend send failed: ${message}`);
+  const to = toEmail.trim().toLowerCase();
+  if (!to) {
+    throw new Error("Missing recipient email");
   }
-}
 
-function renderLicenseEmailHtml(key: string): string {
-  return [
-    "<!doctype html>",
-    '<html><body style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1f2937;padding:24px;max-width:560px;margin:0 auto;">',
-    '  <h2 style="color:#0c1a3a;">Thanks for your purchase</h2>',
-    "  <p>Your GURU Mobile Discovery license key is below. Open the app, choose",
-    "  <strong>Activate License</strong>, paste the key, and click Activate.</p>",
-    '  <p style="background:#f6f8fb;padding:14px;border-radius:8px;border:1px solid #e1e6ed;font-family:Consolas,Menlo,monospace;font-size:15px;word-break:break-all;">',
-    `    ${escapeHtml(key)}`,
-    "  </p>",
-    "  <p>One device per license. You can deactivate and move to another device at any time from",
-    "  <strong>Help &rarr; Deactivate This Device</strong> inside the app.</p>",
-    '  <p style="color:#6b7280;">Need help? Reply to this email and we will get back to you.</p>',
-    "</body></html>",
+  const expiry = formatExpiry(payload);
+  const subject = "Your GURU Mobile Discovery license key";
+  const text = [
+    "Thank you for subscribing to GURU Mobile Discovery.",
+    "",
+    "Your license key (paste this into the app when prompted):",
+    "",
+    token,
+    "",
+    `Licensed to: ${payload.email}`,
+    `Valid through: ${expiry} (includes a 7-day grace period)`,
+    "",
+    "To activate:",
+    "1. Open GURU Mobile Discovery",
+    "2. Paste the license key above into the activation dialog",
+    "3. Click Activate",
+    "",
+    "Keep this email — you'll need the key again if you reinstall.",
+    "Renewals will email a fresh key before your current one expires.",
+    "",
+    "Questions? Reply to this email or contact support.",
   ].join("\n");
-}
 
-function renderLicenseEmailText(key: string): string {
-  return [
-    "Thanks for your purchase!",
-    "",
-    "Your GURU Mobile Discovery license key:",
-    "",
-    `  ${key}`,
-    "",
-    "Open the app, choose Activate License, paste the key, and click Activate.",
-    "One device per license; deactivate any time from Help > Deactivate This Device.",
-  ].join("\n");
-}
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: env.RESEND_FROM_EMAIL,
+      to: [to],
+      subject,
+      text,
+    }),
+  });
 
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Resend failed (${resp.status}): ${body.slice(0, 400)}`);
+  }
 }

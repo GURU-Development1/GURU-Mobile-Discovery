@@ -33,11 +33,14 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QStyle,
     QStyleFactory,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QProxyStyle,
     QLineEdit,
     QDialogButtonBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QAction, QCloseEvent, QMouseEvent, QIcon, QPixmap
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QPoint
+from PyQt6.QtGui import QAction, QCloseEvent, QMouseEvent, QIcon, QPixmap, QPainter, QColor, QBrush, QPalette, QPolygon
 
 from .import_dialog import ImportBackupDialog
 from .search_dialog import SearchDialog
@@ -81,17 +84,188 @@ def _save_cases(cases: Dict[str, str]) -> None:
     _cases_file().write_text(json.dumps({"cases": cases}, indent=2), encoding="utf-8")
 
 
+class CaseTreeProxyStyle(QProxyStyle):
+    """Disclosure chevrons for the case tree.
+
+    Two differences from SavedSearchesTreeProxyStyle:
+      - The chevron is always painted in a dark gray, even when the case row is
+        selected (the saved-searches proxy flips to white on selection).
+      - The chevron is nudged a few pixels to the right within its column so it
+        sits visually inside the rounded selection pill instead of hugging the
+        pill's left edge.
+    """
+
+    _CHEVRON_GRAY = QColor("#6b7280")
+    _CHEVRON_RIGHT_OFFSET = 5
+
+    def drawPrimitive(
+        self,
+        element: QStyle.PrimitiveElement,
+        option,
+        painter: QPainter,
+        widget=None,
+    ) -> None:
+        if element != QStyle.PrimitiveElement.PE_IndicatorBranch:
+            super().drawPrimitive(element, option, painter, widget)
+            return
+        if not (option.state & QStyle.StateFlag.State_Children):
+            super().drawPrimitive(element, option, painter, widget)
+            return
+        rect = option.rect
+        if rect.width() < 4 or rect.height() < 4:
+            return
+        expanded = bool(option.state & QStyle.StateFlag.State_Open)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(self._CHEVRON_GRAY)
+        painter.setPen(Qt.PenStyle.NoPen)
+
+        cx = rect.center().x() + self._CHEVRON_RIGHT_OFFSET
+        cy = rect.center().y()
+        # Half-size chevron: ~8px wide / ~5px tall instead of ~14px / ~11px.
+        cell_h = min(rect.height(), 22)
+        half_w = max(2, min(5, cell_h // 6))
+
+        if expanded:
+            points = [
+                QPoint(cx - half_w, cy - 2),
+                QPoint(cx + half_w, cy - 2),
+                QPoint(cx, cy + max(2, half_w)),
+            ]
+        else:
+            points = [
+                QPoint(cx - 2, cy - half_w),
+                QPoint(cx + max(2, half_w), cy),
+                QPoint(cx - 2, cy + half_w),
+            ]
+        painter.drawPolygon(QPolygon(points))
+        painter.restore()
+
+
+class CaseTreeDelegate(QStyledItemDelegate):
+    """Paints case/backup item contents without any selection / hover background.
+
+    The rounded pill is drawn by CaseTreeWidget.drawRow per item. The delegate
+    just renders the icon and label, with the text forced to white when the row
+    is selected so the label stays readable on the blue pill. Clearing
+    State_Selected / State_MouseOver here also prevents Qt's QStyle code path
+    from painting a stray rectangular selection fill on top of our pill.
+    """
+
+    _SELECTED_TEXT = QColor("#ffffff")
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        was_selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        opt.state &= ~(
+            QStyle.StateFlag.State_Selected
+            | QStyle.StateFlag.State_MouseOver
+            | QStyle.StateFlag.State_HasFocus
+        )
+        opt.backgroundBrush = QBrush(Qt.GlobalColor.transparent)
+        if was_selected:
+            opt.palette.setColor(QPalette.ColorRole.Text, self._SELECTED_TEXT)
+            opt.palette.setColor(QPalette.ColorRole.WindowText, self._SELECTED_TEXT)
+            opt.palette.setColor(QPalette.ColorRole.HighlightedText, self._SELECTED_TEXT)
+        super().paint(painter, opt, index)
+
+
 class CaseTreeWidget(QTreeWidget):
-    """Case/backup tree; empty-area clicks do not clear the current backup selection."""
+    """Case/backup tree; empty-area clicks do not clear the current backup selection.
+
+    Visual model:
+      - A **case** row paints a single rounded blue pill that spans from the
+        viewport's left edge to its right edge, so the disclosure chevron,
+        briefcase icon, and case label all live inside one continuous element.
+      - A **backup** row paints its own rounded pill that starts at the item
+        rect (i.e. just before the phone icon) — there's no chevron column for
+        children, so the empty space to the left of the backup pill stays
+        transparent. The backup pill therefore reads as a self-contained piece
+        offset slightly to the right, sitting visually underneath its parent
+        case rather than being tabbed deeply.
+
+    The pill is painted directly in drawRow. The widget's palette also forces
+    QPalette.Highlight to transparent across every color group (Active,
+    Inactive, Disabled) so Qt's built-in selection painting — which on Windows
+    falls back to a dark grey for inactive selections — cannot leak through
+    behind our custom pill.
+    """
+
+    _SELECTED_BG = QColor("#8fadda")
+    _HOVER_BG = QColor("#dde6f3")
+    _ROW_RADIUS = 6
+    _ROW_HMARGIN = 2  # small inset from the viewport edges
+    _ROW_VMARGIN = 1  # vertical breathing room above/below the pill
+    _BACKUP_LEFT_INSET = 4  # extra px of pill before the backup's icon
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("CaseImportTree")
         self._suppress_restore_selection = False
         base = QStyleFactory.create("Fusion") or QApplication.style()
-        proxy = SavedSearchesTreeProxyStyle(base)
+        proxy = CaseTreeProxyStyle(base)
         proxy.setParent(self)
         self.setStyle(proxy)
+        self.setItemDelegate(CaseTreeDelegate(self))
+        # Hover must register over the chevron column too, not just the item
+        # rect, so the case pill highlights cleanly when the cursor is over the
+        # disclosure arrow.
+        self.setMouseTracking(True)
+        # Force Qt's default selection highlight to transparent across every
+        # palette color group so the system selection color (a dark grey on
+        # Windows when the tree is unfocused) cannot paint behind our pill.
+        pal = self.palette()
+        transparent = QColor(0, 0, 0, 0)
+        for group in (
+            QPalette.ColorGroup.Active,
+            QPalette.ColorGroup.Inactive,
+            QPalette.ColorGroup.Disabled,
+        ):
+            pal.setColor(group, QPalette.ColorRole.Highlight, transparent)
+        self.setPalette(pal)
+        # Qt invalidates only each item's visualRect on selection change, but
+        # our custom pill is wider than the visualRect (it spans the full row).
+        # Without a full-viewport repaint a thin "sliver" of the previous pill
+        # can linger to the right of a deselected row until the next paint.
+        self.itemSelectionChanged.connect(self.viewport().update)
+
+    def drawRow(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        item = self.itemFromIndex(index)
+        selected = item is not None and item.isSelected()
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        if selected or hovered:
+            is_top_level = item is not None and item.parent() is None
+            viewport_rect = self.viewport().rect()
+            if is_top_level:
+                # Case pill extends to the very left of the viewport so the
+                # chevron + briefcase + label are all visually inside one pill.
+                left = viewport_rect.left() + self._ROW_HMARGIN
+            else:
+                # Backup pill starts just before the item rect (after the
+                # indent), giving the row a self-contained pill that's offset
+                # to the right of its parent case pill.
+                item_rect = self.visualRect(index)
+                left = max(
+                    viewport_rect.left() + self._ROW_HMARGIN,
+                    item_rect.left() - self._BACKUP_LEFT_INSET,
+                )
+            right = viewport_rect.right() - self._ROW_HMARGIN
+            pill = QRect(
+                left,
+                option.rect.y() + self._ROW_VMARGIN,
+                max(0, right - left),
+                option.rect.height() - 2 * self._ROW_VMARGIN,
+            )
+            color = self._SELECTED_BG if selected else self._HOVER_BG
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(pill, self._ROW_RADIUS, self._ROW_RADIUS)
+            painter.restore()
+        super().drawRow(painter, option, index)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.RightButton:
@@ -349,9 +523,9 @@ class MainWindow(QMainWindow):
         change_license_action = QAction("Change License Key…", self)
         change_license_action.triggered.connect(self._on_change_license)
         help_menu.addAction(change_license_action)
-        deactivate_action = QAction("Deactivate This Device…", self)
-        deactivate_action.triggered.connect(self._on_deactivate_license)
-        help_menu.addAction(deactivate_action)
+        remove_license_action = QAction("Remove License from This Device…", self)
+        remove_license_action.triggered.connect(self._on_remove_license)
+        help_menu.addAction(remove_license_action)
         help_menu.addSeparator()
         about_action = QAction("About", self)
         about_action.triggered.connect(self._on_about)
@@ -410,11 +584,20 @@ class MainWindow(QMainWindow):
         # Right: content area
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        # Match the case-tree container's vertical margins (8 top / 8 bottom) so
+        # the bottom edge of the right panel lines up with the bottom edge of
+        # the cases list instead of sitting a few px lower from Qt's default
+        # (11 px) layout margins.
+        right_layout.setContentsMargins(4, 8, 8, 8)
         self._stack = QStackedWidget()
         self._placeholder = self._build_empty_placeholder()
         self._stack.addWidget(self._placeholder)
         self._message_panel = QWidget()
         msg_panel_layout = QVBoxLayout(self._message_panel)
+        # Drop Qt's default ~11 px layout margins so the tabs fill the right
+        # side fully and the panel's bottom edge lines up with the case-tree
+        # panel's bottom edge.
+        msg_panel_layout.setContentsMargins(0, 0, 0, 0)
         self._message_views = MessageViews()
         self._message_views.add_search_requested.connect(self._open_search_dialog)
         self._message_views.edit_search_requested.connect(self._open_edit_search_dialog)
@@ -1036,7 +1219,9 @@ class MainWindow(QMainWindow):
             lambda criteria: self._run_search(criteria, notify=True)
         )
         dlg.exec()
-        self._message_views.refresh_saved_searches_list()
+        # Expand the folder the new search was filed under so it's visible
+        # immediately instead of staying hidden behind a collapsed parent.
+        self._message_views.refresh_saved_searches_list(expand_folder_id=default_folder_id)
 
     def _open_edit_search_dialog(self, search_id: str) -> None:
         if not self._current_backup_id:
@@ -1490,22 +1675,16 @@ class MainWindow(QMainWindow):
         svc = self._license_service
         if svc is None or not svc.is_cached():
             return ""
-        key = svc.cached_key()
-        masked = key[-4:].rjust(len(key), "•") if key else ""
+        email = svc.cached_email() or "—"
         expires = svc.cached_expires_at() or ""
         expires_short = expires[:10] if expires else "—"
         return (
-            f'<p style="text-align:center;">Licensed device · key ending '
-            f'<code>{masked}</code><br>Expires: {expires_short}</p>'
+            f'<p style="text-align:center;">Licensed to <code>{email}</code>'
+            f'<br>Expires: {expires_short}</p>'
         )
 
     def _on_change_license(self) -> None:
         if self._license_service is None:
-            QMessageBox.information(
-                self,
-                "License",
-                "Licensing is not configured for this build.",
-            )
             return
         from app.license_dialog import LicenseDialog
         dlg = LicenseDialog(
@@ -1522,32 +1701,32 @@ class MainWindow(QMainWindow):
                 "License updated for this device.",
             )
 
-    def _on_deactivate_license(self) -> None:
+    def _on_remove_license(self) -> None:
         if self._license_service is None or not self._license_service.is_cached():
             QMessageBox.information(
                 self,
-                "Deactivate license",
+                "Remove license",
                 "No license is active on this device.",
             )
             return
         ok = QMessageBox.question(
             self,
-            "Deactivate this device",
-            "Deactivate this device's license? You will need to re-enter your key to use the "
-            "app again, and the seat will be freed for use on another device.",
+            "Remove license from this device",
+            "Remove the cached license from this device? You will need to paste your "
+            "license key again to use the app.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) == QMessageBox.StandardButton.Yes
         if not ok:
             return
-        success, msg = self._license_service.deactivate()
+        success, msg = self._license_service.remove_license()
         if not success:
-            QMessageBox.warning(self, "Deactivate license", msg)
+            QMessageBox.warning(self, "Remove license", msg)
             return
         QMessageBox.information(
             self,
-            "Deactivated",
-            "This device has been deactivated. The app will now close.",
+            "License removed",
+            "The license has been removed from this device. The app will now close.",
         )
         QApplication.quit()
 

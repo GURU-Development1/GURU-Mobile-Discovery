@@ -244,85 +244,55 @@ QComboBox QAbstractItemView {
    ========================================================= */
 /* Saved searches: scoped QSS so Qt still calls PE_IndicatorBranch (proxy paints chevrons).
    A global QTreeWidget stylesheet makes Qt paint branches via the style sheet engine and
-   skips primitive painting — invisible disclosure icons. */
-/* Whole-row selection needs square corners on ::item; Fusion + proxy on SavedSearchesTree. */
+   skips primitive painting — invisible disclosure icons.
+
+   Selection / hover pills are painted by SavedSearchesTree.drawRow per item:
+     - Top-level folders paint a pill flush with the viewport's left edge.
+     - Nested folders / saved searches paint an offset pill at their item rect.
+   Qt's default selection highlight is forced transparent in the widget's palette so the
+   system selection color can't leak through behind the custom pill. The QSS below only sets
+   spacing and the resting text color; the selected text color is forced white by
+   SavedSearchesTreeDelegate via the option palette. */
 #SavedSearchesTree {
     background-color: #ffffff;
     border: 1px solid #e1e6ed;
     border-radius: 8px;
     padding: 0 6px 6px 6px;
     outline: none;
-    show-decoration-selected: 1;
-    selection-background-color: #4a73b8;
-    selection-color: #ffffff;
 }
 
 #SavedSearchesTree::item {
     padding: 7px 10px;
-    border-radius: 0;
-    margin: 0;
+    margin: 1px 0;
     border: none;
     color: #1f2937;
-}
-
-#SavedSearchesTree::item:hover {
-    background-color: #eaf0f8;
-}
-
-#SavedSearchesTree::item:selected:hover {
-    background-color: #4a73b8;
-    color: white;
-}
-
-#SavedSearchesTree::item:selected {
-    background-color: #4a73b8;
-    color: white;
-}
-
-#SavedSearchesTree::item:selected:!active {
-    background-color: #4a73b8;
-    color: white;
+    background: transparent;
 }
 
 /* Do not style #SavedSearchesTree::branch — QSS on ::branch forces Qt's stylesheet branch path and PE_IndicatorBranch is never drawn (no proxy chevrons). */
 
 /* Case / backup tree — disclosure chevrons painted by SavedSearchesTreeProxyStyle on CaseTreeWidget */
+/* The selection / hover pill is painted by CaseTreeWidget.drawRow per item:
+     - Case rows paint a pill covering chevron + briefcase + label (one piece).
+     - Backup rows paint a pill at the item rect, offset to the right under the case.
+   Qt's default selection highlight is forced transparent in the widget's palette so the system
+   selection color (e.g. inactive dark grey on Windows) can't leak through behind the custom pill.
+   The QSS rules below only set spacing and the resting text color; selected text color is forced
+   by CaseTreeDelegate via the option palette. */
 QTreeWidget#CaseImportTree {
     background-color: #ffffff;
     border: 1px solid #e1e6ed;
     border-radius: 8px;
     padding: 6px;
     outline: none;
-    show-decoration-selected: 1;
-    selection-background-color: #4a73b8;
-    selection-color: #ffffff;
 }
 
 QTreeWidget#CaseImportTree::item {
     padding: 7px 10px;
-    border-radius: 5px;
     margin: 1px 0;
     border: none;
     color: #1f2937;
-}
-
-QTreeWidget#CaseImportTree::item:hover {
-    background-color: #eaf0f8;
-}
-
-QTreeWidget#CaseImportTree::item:selected:hover {
-    background-color: #4a73b8;
-    color: white;
-}
-
-QTreeWidget#CaseImportTree::item:selected {
-    background-color: #4a73b8;
-    color: white;
-}
-
-QTreeWidget#CaseImportTree::item:selected:!active {
-    background-color: #4a73b8;
-    color: white;
+    background: transparent;
 }
 
 QHeaderView:horizontal::section {
@@ -418,10 +388,13 @@ QTableWidget::item:alternate:selected {
    Tab widget
    ========================================================= */
 QTabWidget::pane {
-    border: 1px solid #e1e6ed;
-    border-radius: 8px;
+    /* No border / radius — the tab content sits directly on the panel
+       background instead of inside its own bordered card. */
+    border: none;
     background-color: #ffffff;
-    top: -1px;
+    /* Push the pane down so the tab labels have visible breathing room above
+       the first row of tab content. */
+    top: 6px;
 }
 
 QTabBar::tab {

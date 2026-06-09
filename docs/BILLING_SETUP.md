@@ -1,66 +1,90 @@
-# Lemon Squeezy + Keygen + Resend billing setup (full walkthrough)
+# Stripe + Ed25519 + Resend billing setup
 
-Use this guide when you are ready to wire payments to license keys. The Cloudflare Worker lives under [`server/billing/`](../server/billing/). For quick commands and env vars, see [`server/billing/README.md`](../server/billing/README.md).
+Wire Stripe subscription payments to Ed25519-signed license keys emailed via Resend. The desktop app verifies tokens fully offline — see [LICENSE_SPEC.md](../LICENSE_SPEC.md).
 
----
-
-## Stage 0 — Accounts and tools
-
-Set these up before anything else:
-
-| Item | Notes |
-|------|--------|
-| **Lemon Squeezy** | [lemonsqueezy.com](https://www.lemonsqueezy.com). Create a store and subscription product. |
-| **Keygen** | Account + product + policy (`maxMachines: 1`, license auth). IDs may already be in [`app/license_config.py`](../app/license_config.py). |
-| **Resend** | [resend.com](https://resend.com). Verify a sending domain (production) or use sandbox `onboarding@resend.dev` for early tests. |
-| **Cloudflare** | Free Workers account at [dash.cloudflare.com](https://dash.cloudflare.com/sign-up). |
-
-**Install locally:**
-
-- **Node.js 20+** (LTS): [nodejs.org](https://nodejs.org)
+Worker source: [`server/billing/`](../server/billing/)
 
 ---
 
-## Stage 1 — Lemon Squeezy dashboard
+## Architecture
 
-1. **Create a store** (if you have not already).
-
-2. **Create the product**
-   - Name: `GURU Mobile Discovery`
-   - Pricing: **Subscription**, **Yearly** (or your preferred billing interval)
-   - Save and note the **Store ID** and **Variant ID**
-
-3. **Copy the checkout URL**
-   - From the product share/checkout link, e.g. `https://yourstore.lemonsqueezy.com/checkout/buy/...`
-   - You will paste this into [`app/license_config.py`](../app/license_config.py) as `_DEFAULT_LEMON_SQUEEZY_CHECKOUT_URL` (or set env var `GURU_LEMON_SQUEEZY_CHECKOUT_URL` at build/runtime)
-
-4. **Webhook:** Do **not** add it yet — you need the Worker URL from Stage 4 first.
+```
+Buyer → Stripe Checkout (Payment Link)
+     → Stripe webhook POST /stripe/webhook
+          → verify Stripe-Signature
+          → GET subscription (period end + email)
+          → Ed25519 sign license token
+          → Resend email with token
+     → Buyer pastes token into app Activate dialog
+```
 
 ---
 
-## Stage 2 — Keygen
+## Stage 0 — Accounts
 
-1. **Account ID** and **Product ID** — match [`app/license_config.py`](../app/license_config.py) (`KEYGEN_ACCOUNT_ID`, `KEYGEN_PRODUCT_ID`).
+| Service | Purpose |
+|---------|---------|
+| [Stripe](https://dashboard.stripe.com) | Payments + subscriptions |
+| [Cloudflare](https://dash.cloudflare.com) | Host the Worker (free tier OK) |
+| [Resend](https://resend.com) | Email license keys |
 
-2. **Policy ID** — Keygen → **Policies** → open your single-seat policy → copy UUID (`KEYGEN_POLICY_ID` for the Worker).
+---
 
-3. **Admin token** — **Account → Tokens → New** (Bearer, admin). Copy immediately. Worker needs scopes such as: `license.create`, `license.read`, `license.update`, `license.update.suspend`, `license.update.reinstate`, `license.renew`.
+## Stage 1 — Ed25519 signing key
+
+The app embeds this **public** key in [`app/license_config.py`](../app/license_config.py):
+
+```
+MCowBQYDK2VwAyEAycKQYoxlPBkxzkG/y65qMaklbUB6Wj7uXG1iAJk9UHM=
+```
+
+The worker needs the matching **private** key as `LICENSE_SIGNING_KEY`.
+
+### If you already have the private key
+
+Set it as the Worker secret (PKCS8 DER, base64). **Do not change the app public key.**
+
+### If you need a new keypair
+
+From the repo root:
+
+```bash
+python scripts/generate_license_keypair.py
+```
+
+This prints:
+- `LICENSE_PUBLIC_KEY_SPKI_B64` → update [`app/license_config.py`](../app/license_config.py)
+- `LICENSE_SIGNING_KEY` → Worker secret
+- A sample token to test in the app
+
+---
+
+## Stage 2 — Stripe
+
+1. **Test mode** in Stripe Dashboard (toggle top-right).
+2. Create product **GURU Mobile Discovery** with a **yearly** recurring price.
+3. Create a **Payment Link** → copy the URL.
+4. Set in [`app/license_config.py`](../app/license_config.py):
+
+   ```python
+   _DEFAULT_STRIPE_CHECKOUT_URL = "https://buy.stripe.com/test_..."
+   ```
+
+   Or env var `GURU_STRIPE_CHECKOUT_URL`.
+
+5. Test card: `4242 4242 4242 4242`, any future expiry, any CVC.
 
 ---
 
 ## Stage 3 — Resend
 
-1. **API key** — Dashboard → **API Keys → Create** → copy `re_...`
-
-2. **From address**
-   - Production: verify your domain in Resend, then use e.g. `licenses@yourdomain.com`
-   - Early test: `onboarding@resend.dev` (sandbox limits apply)
+1. Create API key (`re_...`).
+2. Verify your sending domain (production) or use `onboarding@resend.dev` for early tests (sandbox limits apply).
+3. Choose `RESEND_FROM_EMAIL`, e.g. `licenses@yourdomain.com`.
 
 ---
 
-## Stage 4 — Deploy the Cloudflare Worker
-
-From the repo root:
+## Stage 4 — Deploy the Worker
 
 ```bash
 cd server/billing
@@ -68,25 +92,15 @@ npm install
 npx wrangler login
 ```
 
-Set secrets (Wrangler prompts for each value):
+Set secrets:
 
 ```bash
-npx wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET
-npx wrangler secret put KEYGEN_ACCOUNT_ID
-npx wrangler secret put KEYGEN_PRODUCT_ID
-npx wrangler secret put KEYGEN_POLICY_ID
-npx wrangler secret put KEYGEN_ADMIN_TOKEN
+npx wrangler secret put LICENSE_SIGNING_KEY
+npx wrangler secret put STRIPE_WEBHOOK_SECRET
+npx wrangler secret put STRIPE_SECRET_KEY
 npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put RESEND_FROM_EMAIL
 ```
-
-Optional (recommended in production):
-
-```bash
-npx wrangler secret put LEMON_SQUEEZY_STORE_ID
-```
-
-Skip `LEMON_SQUEEZY_WEBHOOK_SECRET` until Stage 5 if you prefer to deploy the Worker first.
 
 Deploy:
 
@@ -94,121 +108,67 @@ Deploy:
 npm run deploy
 ```
 
-Copy the published Worker URL (e.g. `https://gmd-billing.<subdomain>.workers.dev`).
+Copy the Worker URL (e.g. `https://gmd-billing.<subdomain>.workers.dev`).
 
-Sanity: open `https://<worker-host>/healthz` → should return `ok`.
-
----
-
-## Stage 5 — Lemon Squeezy webhook
-
-1. Lemon Squeezy → **Settings → Webhooks → Create webhook**
-
-2. **URL:** `https://<worker-host>/lemonsqueezy/webhook`
-
-3. **Signing secret** — choose a secret (6–40 characters); save it for the Worker.
-
-4. **Events** (subscribe to these):
-
-   - `subscription_created`
-   - `subscription_updated`
-   - `subscription_cancelled`
-   - `subscription_expired`
-   - `subscription_resumed`
-   - `subscription_unpaused`
-   - `subscription_payment_success`
-   - `subscription_payment_failed`
-   - `subscription_payment_refunded`
-
-5. Back in `server/billing`:
-
-```bash
-npx wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET
-```
-
-Paste the signing secret, then redeploy:
-
-```bash
-npm run deploy
-```
+Sanity check: open `https://<worker-host>/healthz` → `ok`.
 
 ---
 
-## Stage 6 — Desktop app “Buy” link
+## Stage 5 — Stripe webhook
 
-In [`app/license_config.py`](../app/license_config.py), set `_DEFAULT_LEMON_SQUEEZY_CHECKOUT_URL` to your Lemon Squeezy checkout URL, or set env var `GURU_LEMON_SQUEEZY_CHECKOUT_URL` at runtime.
-
-When the checkout URL is **empty**, the license dialog still shows **Buy one**, but clicking it opens a **Coming soon** message. Set the URL when you are ready to accept purchases.
+1. Stripe Dashboard → **Developers → Webhooks → Add endpoint**
+2. URL: `https://<worker-host>/stripe/webhook`
+3. Events:
+   - `checkout.session.completed`
+   - `invoice.paid`
+4. Copy the **signing secret** (`whsec_...`) → `wrangler secret put STRIPE_WEBHOOK_SECRET` → redeploy.
 
 ---
 
-## Stage 7 — End-to-end test
+## Stage 6 — End-to-end test
 
-1. Run the app → activation dialog → **Buy one** (opens checkout when URL is set).
+1. Run the app → **Buy one** → complete test checkout.
+2. Tail Worker logs: `cd server/billing && npm run tail`
+3. Check email for the license key.
+4. Paste into **Activate** in the app.
 
-2. Complete checkout with Lemon Squeezy test mode. Use an email that can receive mail.
-
-3. Tail Worker logs:
+### Local webhook testing (optional)
 
 ```bash
 cd server/billing
-npm run tail
-```
-
-   Expect `POST .../lemonsqueezy/webhook` → 200.
-
-4. Check email for the license key → paste into **Activate** in the app.
-
----
-
-## Stage 8 — Verify cancellation
-
-1. Lemon Squeezy → cancel the test subscription.
-
-2. Relaunch the app — license should fail validation / prompt again if suspended.
-
----
-
-## Stage 9 — Going live
-
-1. Lemon Squeezy: switch to **Live mode**; recreate or enable live checkout and register a webhook pointing at your **production** Worker URL.
-
-2. Resend: use a verified domain and production API key.
-
-3. Worker secrets for production (example):
-
-```bash
-npx wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET --env production
-# ... repeat each secret with --env production
-npm run deploy:prod
-```
-
-4. Update `_DEFAULT_LEMON_SQUEEZY_CHECKOUT_URL` (or build-time env) to the **live** checkout URL before shipping the installer.
-
----
-
-## Local development (optional)
-
-From `server/billing`:
-
-```bash
+# Put secrets in .dev.vars (gitignored)
 npm run dev
 ```
 
-Put secrets in `server/billing/.dev.vars` (gitignored). Example `.dev.vars`:
+In another terminal:
 
-```
-LEMON_SQUEEZY_WEBHOOK_SECRET=your-signing-secret
-LEMON_SQUEEZY_STORE_ID=12345
-KEYGEN_ACCOUNT_ID=...
-KEYGEN_PRODUCT_ID=...
-KEYGEN_POLICY_ID=...
-KEYGEN_ADMIN_TOKEN=...
-RESEND_API_KEY=re_...
-RESEND_FROM_EMAIL=licenses@example.com
+```bash
+stripe listen --forward-to localhost:8787/stripe/webhook
+stripe trigger checkout.session.completed
 ```
 
-Use a tunnel (e.g. ngrok, Cloudflare Tunnel) to forward Lemon Squeezy webhooks to `http://localhost:8787/lemonsqueezy/webhook` for local testing.
+---
+
+## Secrets reference
+
+| Secret | Example | Notes |
+|--------|---------|-------|
+| `LICENSE_SIGNING_KEY` | base64 PKCS8 DER | Ed25519 **private** key; pairs with app public key |
+| `STRIPE_WEBHOOK_SECRET` | `whsec_...` | From webhook endpoint settings |
+| `STRIPE_SECRET_KEY` | `sk_test_...` | For fetching subscription/customer details |
+| `RESEND_API_KEY` | `re_...` | Resend dashboard |
+| `RESEND_FROM_EMAIL` | `licenses@domain.com` | Must be verified in Resend |
+
+Local dev: create `server/billing/.dev.vars` with the same keys (Wrangler loads it automatically).
+
+---
+
+## Renewal and cancellation
+
+| Event | Behavior |
+|-------|----------|
+| `invoice.paid` (renewal) | New token emailed with later `exp` |
+| Subscription cancelled | No new tokens; current token lapses at `exp` |
 
 ---
 
@@ -216,11 +176,11 @@ Use a tunnel (e.g. ngrok, Cloudflare Tunnel) to forward Lemon Squeezy webhooks t
 
 | Symptom | Likely cause |
 |---------|----------------|
-| Webhook `400` / signature failed | Wrong signing secret for that webhook endpoint |
-| No email | Resend sandbox / unverified domain / recipient not allowed |
-| Keygen `401` | Bad admin token or missing scopes |
-| App activates but later breaks | Policy mismatch (product scope, machine limit, license auth) |
-| “Buy one” shows Coming soon | `LEMON_SQUEEZY_CHECKOUT_URL` / `_DEFAULT_LEMON_SQUEEZY_CHECKOUT_URL` empty |
+| Webhook 400 / signature failed | Wrong `STRIPE_WEBHOOK_SECRET` for that endpoint |
+| App rejects key | Public/private key mismatch; or token tampered |
+| No email | Resend domain not verified / sandbox recipient limits |
+| Stripe API 401 | Wrong `STRIPE_SECRET_KEY` or test/live mismatch |
+| Buy shows Coming soon | Empty `STRIPE_CHECKOUT_URL` in `license_config.py` |
 
 ---
 
@@ -228,7 +188,8 @@ Use a tunnel (e.g. ngrok, Cloudflare Tunnel) to forward Lemon Squeezy webhooks t
 
 | File | Purpose |
 |------|---------|
-| [`server/billing/`](../server/billing/) | Worker source (`lemon_squeezy.ts`, `keygen.ts`, `email.ts`) |
-| [`server/billing/README.md`](../server/billing/README.md) | Commands, secrets list, local `.dev.vars` |
-| [`app/license_config.py`](../app/license_config.py) | Keygen public IDs + `LEMON_SQUEEZY_CHECKOUT_URL` |
-| [`app/license_dialog.py`](../app/license_dialog.py) | Buy link → checkout URL or Coming soon dialog |
+| [`server/billing/`](../server/billing/) | Worker source |
+| [`LICENSE_SPEC.md`](../LICENSE_SPEC.md) | Token format + verification |
+| [`app/license_config.py`](../app/license_config.py) | Public key + checkout URL |
+| [`app/license_verify.py`](../app/license_verify.py) | Desktop offline verifier |
+| [`scripts/generate_license_keypair.py`](../scripts/generate_license_keypair.py) | Generate new keypair |

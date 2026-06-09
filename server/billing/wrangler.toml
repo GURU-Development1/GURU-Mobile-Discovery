@@ -1,13 +1,7 @@
 name = "gmd-billing"
 main = "src/index.ts"
-compatibility_date = "2024-09-01"
+compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Default (dev / preview) environment uses the top-level config.
-# Run secrets with: wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET  (etc.)
-
 [env.production]
-name = "gmd-billing-prod"
-
-# Production secrets are scoped per-env:
-#   wrangler secret put LEMON_SQUEEZY_WEBHOOK_SECRET --env production
+name = "gmd-billing-production"

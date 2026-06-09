@@ -12,18 +12,18 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
-    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QVBoxLayout,
 )
 
-from app.license_config import LEMON_SQUEEZY_CHECKOUT_URL, has_checkout_url
+from app.license_config import STRIPE_CHECKOUT_URL, has_checkout_url
 from app.license_service import LicenseService, LicenseStatus
+from app.license_verify import normalize_license_token
 from app.style import logo_path as resolve_logo_path
 
 
@@ -80,8 +80,8 @@ class LicenseDialog(QDialog):
         outer.addWidget(logo_label)
 
         intro = QLabel(
-            "Enter your license key to activate this device. "
-            "Each license can be active on one device at a time."
+            "Enter your license key to activate GURU Mobile Discovery. "
+            "Your key was emailed to you after purchase."
         )
         intro.setAlignment(Qt.AlignmentFlag.AlignCenter)
         intro.setWordWrap(True)
@@ -90,13 +90,21 @@ class LicenseDialog(QDialog):
         key_label = QLabel("License key:")
         outer.addWidget(key_label)
 
-        self._key_edit = QLineEdit()
-        self._key_edit.setPlaceholderText("GMD-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX")
+        self._key_edit = QPlainTextEdit()
+        self._key_edit.setPlaceholderText(
+            "Paste your license key (one long string ending in a \".\" then more characters)"
+        )
         mono = QFont("Consolas")
         mono.setStyleHint(QFont.StyleHint.Monospace)
         self._key_edit.setFont(mono)
+        self._key_edit.setFixedHeight(72)
+        # Word wrap inserts block newlines into toPlainText(), which breaks tokens.
+        self._key_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._key_edit.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         if prefilled_key:
-            self._key_edit.setText(prefilled_key)
+            self._key_edit.setPlainText(prefilled_key)
         outer.addWidget(self._key_edit)
 
         self._progress = QProgressBar()
@@ -147,7 +155,7 @@ class LicenseDialog(QDialog):
     # ---------- handlers ----------
 
     def _on_activate_clicked(self) -> None:
-        key = self._key_edit.text().strip()
+        key = normalize_license_token(self._key_edit.toPlainText())
         if not key:
             self._show_error("Enter a license key.")
             return
@@ -180,7 +188,7 @@ class LicenseDialog(QDialog):
 
     def _on_buy_clicked(self, _link: str) -> None:
         if has_checkout_url():
-            webbrowser.open(LEMON_SQUEEZY_CHECKOUT_URL, new=2)
+            webbrowser.open(STRIPE_CHECKOUT_URL, new=2)
             return
         QMessageBox.information(
             self,
@@ -213,4 +221,4 @@ def request_activation(
         allow_close_without_activation=not launch_gate,
     )
     ok = dlg.exec() == QDialog.DialogCode.Accepted
-    return ok, dlg._key_edit.text().strip()
+    return ok, normalize_license_token(dlg._key_edit.toPlainText())
